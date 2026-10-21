@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t .
+
+      - name: Release consistency
+        run: python scripts/check_release.py
+
+  result:
+    # One check to require in the branch protection of main, however many jobs the matrix has.
+    name: All tests passed
+    if: ${{ always() }}
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      TEST_RESULT: ${{ needs.test.result }}
+    steps:
+      - name: Fail unless every test job succeeded
+        run: test "$TEST_RESULT" = "success"

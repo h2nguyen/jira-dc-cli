@@ -1,0 +1,7 @@
+issue_key,project,issuetype,summary,description,labels,priority,assignee,components,fix_versions,fields_json
+,DEMO,Story,User can export the monthly report,"Goal: Allow users to export the report.
+
+Acceptance criteria:
+- Export is available to authorized users.
+- Exported data matches the report.","reporting,backlog",Medium,,Reporting,Release 1.0,"{}"
+,DEMO,Task,Prepare export test data,"Prepare representative test data, including an empty report.","reporting,test-data",Medium,,Reporting,Release 1.0,"{}"

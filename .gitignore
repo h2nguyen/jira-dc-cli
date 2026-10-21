@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+tmp/
+
+# editors, operating systems, local environments
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+.venv/
+venv/
+*.log

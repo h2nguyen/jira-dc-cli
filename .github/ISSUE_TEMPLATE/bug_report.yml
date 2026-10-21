@@ -1,0 +1,90 @@
+name: Bug report
+description: Something does not work as documented. Redact tokens, site names and page content before you write.
+title: "Bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report this. Before you start, search the existing issues and run `jira doctor`:
+        most setup problems are explained there.
+
+        **Redact before you paste.** Never post a token, the name of a real Jira site, or real Jira content (issue text,
+        names, e-mail addresses, links). Use placeholders such as `https://jira.example.com`, `PROJ-123` and `[token]`.
+        Also remove your user name, your computer name and local folder paths from pasted output (`jira doctor` prints
+        where your settings file is).
+        A security problem is not an issue: use the Security tab of this repository (see `SECURITY.md`).
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed every token, site name and piece of page content (issue text, names, e-mail addresses) from this report.
+          required: true
+        - label: I searched the existing issues and read the troubleshooting guide.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `jira version`.
+      placeholder: jira-dc-cli 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: The output of `python --version`.
+      placeholder: Python 3.13.3
+    validations:
+      required: true
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      description: Git Bash, PowerShell, cmd, bash, zsh and so on.
+    validations:
+      required: false
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The command you ran and what you saw, redacted. Add `-v` to log each request, or `--json` to get the error as JSON.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps that shows the problem. A failing test against the bundled mock Jira is the best report.
+      placeholder: |
+        1. jira ...
+        2. ...
+    validations:
+      required: false
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Paste the output, redacted. It is shown as code.
+      render: text
+    validations:
+      required: false

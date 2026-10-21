@@ -1,0 +1,3 @@
+issue_key,project,issuetype,summary,description,labels,priority,assignee,components,fix_versions,fields_json
+,DEMO,Task,Imported task,"Description can contain, commas","import,backlog",Medium,,Platform,,"{""customfield_12345"":""Value""}"
+DEMO-123,,,Updated summary,Updated from CSV,imported,,,,,"{}"

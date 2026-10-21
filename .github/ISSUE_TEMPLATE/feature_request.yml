@@ -1,0 +1,56 @@
+name: Feature request
+description: Suggest a change or ask a question. Redact tokens, site names and page content before you write.
+title: "Feature: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the idea. jira-dc-cli is a small, safe command line client for Jira Data Center that needs nothing but
+        the Python standard library; `CONTRIBUTING.md` explains what fits and what does not (for example Jira Cloud, a
+        graphical interface or a dependency). A question is welcome here too: start the title with "Question:".
+
+        **Redact before you paste.** Never post a token, the name of a real Jira site, or real Jira content (issue text,
+        names, e-mail addresses, links). Use placeholders such as `https://jira.example.com` and `PROJ-123`. Also remove
+        your user name, your computer name and local folder paths from anything you paste.
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before you submit
+      options:
+        - label: I removed every token, site name and piece of page content (issue text, names, e-mail addresses) from this request.
+          required: true
+        - label: I searched the existing issues and the documentation.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what is hard or impossible today? Describe the problem before the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: The command, option or behavior you have in mind, with an example of how you would use it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do today
+      description: How you work around it now, and other solutions you considered.
+    validations:
+      required: false
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you like to build it?
+      description: The maintainers are volunteers; a pull request is the fastest way, and an issue is the place to agree on the idea first.
+      options:
+        - "No, I would only like to see it"
+        - "Yes, I would open a pull request"
+        - "Maybe, with some guidance"
+    validations:
+      required: false

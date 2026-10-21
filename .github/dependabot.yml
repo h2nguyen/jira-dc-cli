@@ -1,0 +1,11 @@
+# The program has no dependencies; the only thing that goes stale is the actions that the workflows use.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
