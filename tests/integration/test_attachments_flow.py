@@ -556,7 +556,10 @@ class AttachmentsFlowTest(EndToEnd):
         before = self.config.read_bytes()
         link = self.folder.parent / f"{self.folder.name}-link"
         make_folder_link(self, link, self.folder)
-        self.addCleanup(lambda: os.rmdir(link) if os.path.isdir(link) else None)
+        # a relative path needs the drive of the folder: a Windows runner keeps the repository on D: and the temp folder on C:
+        original = os.getcwd()
+        os.chdir(self.folder.parent)
+        self.addCleanup(os.chdir, original)
         spellings = {
             "the folder": str(self.folder), "with dots": str(self.folder / "." / "sub" / ".."), "through a link": str(link),
             "a relative path": os.path.relpath(self.folder),
@@ -672,7 +675,10 @@ class AttachmentsFlowTest(EndToEnd):
         if os.name == "nt":
             self.skipTest("Windows file names cannot hold a lone surrogate")
         odd = self.folder / os.fsdecode(b"odd\xff.txt")  # a name that is not UTF-8 on a system that allows it: a lone surrogate in a Python string
-        odd.write_bytes(b"data")
+        try:
+            odd.write_bytes(b"data")
+        except (OSError, UnicodeError):
+            self.skipTest("this file system takes only file names that are valid UTF-8 (macOS does not take this one)")
         result = self.cli("attach", "PROJ-1", str(odd), "--json")
         self.assertEqual(result.code, 1)
         self.assertIn("has a name that is no text", result.error()["message"])

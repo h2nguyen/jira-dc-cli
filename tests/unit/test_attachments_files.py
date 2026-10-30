@@ -14,19 +14,29 @@ from jira_dc_cli.application.ports_attachments import CreatesExclusively, Resolv
 from jira_dc_cli.domain.errors import ValidationError
 
 
+def take_away_link(link: Path) -> None:
+    """Remove the link, and never what it leads to: `rmdir` takes a junction or a link to a folder on Windows and fails on a symbolic link
+    on Linux and macOS (`NotADirectoryError`), where `unlink` takes it."""
+    for remove in (os.rmdir, os.unlink):
+        try:
+            return remove(link)
+        except OSError:
+            continue
+
+
 def make_folder_link(test: unittest.TestCase, link: Path, target: Path) -> None:
     """`link` as another way to reach the folder `target`: a symbolic link, or on Windows, where that needs a privilege, a junction. The
-    test is skipped on a system that lets neither be made."""
+    link (and not what it leads to) is taken away again when the test ends. The test is skipped on a system that lets neither be made."""
+    made = False
     try:
         os.symlink(target, link, target_is_directory=True)
-        return
+        made = True
     except (OSError, NotImplementedError, AttributeError):
-        pass
-    if os.name == "nt":
-        done = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
-        if done.returncode == 0:
-            return
-    test.skipTest("this system does not let the test make a link to a folder")
+        if os.name == "nt":
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True).returncode == 0
+    if not made:
+        test.skipTest("this system does not let the test make a link to a folder")
+    test.addCleanup(take_away_link, link)
 
 
 class Case(unittest.TestCase):
@@ -171,6 +181,10 @@ class LocalFilesTest(Case):
         direct = files.resolve(str(self.root / "sub" / "file.txt"))
         self.assertEqual(files.resolve(str(self.root / "sub" / ".." / "sub" / "file.txt")), direct)
         self.assertEqual(files.resolve(str(self.root / "sub" / "." / "file.txt")), direct)
+        # a relative path needs the drive of the folder: a Windows runner keeps the repository on D: and the temp folder on C:
+        original = os.getcwd()
+        os.chdir(self.root.parent)
+        self.addCleanup(os.chdir, original)
         self.assertEqual(files.resolve(os.path.relpath(self.root / "sub" / "file.txt")), direct)
         self.assertNotEqual(files.resolve(str(self.root / "other" / "file.txt")), direct)
         self.assertTrue(os.path.isabs(files.resolve("relative.txt")))
@@ -192,6 +206,43 @@ class LocalFilesTest(Case):
         files = LocalFiles()
         self.assertIsInstance(files.resolve("a\x00b"), str)
         self.assertIsInstance(files.resolve(str(self.root / "does" / "not" / "exist")), str)
+
+
+class TakeAwayLinkTest(Case):
+    """The cleanup of a test that made a link: it removes the link, on every system, and never what the link leads to."""
+
+    def test_a_symbolic_link_is_taken_away_with_unlink_where_rmdir_refuses_it(self):
+        link = self.root / "link"
+        refusal = NotADirectoryError(errno.ENOTDIR, "Not a directory")  # what `os.rmdir` says to a symbolic link on Linux and macOS
+        with mock.patch("os.rmdir", side_effect=refusal) as rmdir, mock.patch("os.unlink") as unlink:
+            take_away_link(link)
+        rmdir.assert_called_once_with(link)
+        unlink.assert_called_once_with(link)
+
+    def test_a_junction_or_a_link_to_a_folder_on_windows_is_taken_away_with_rmdir_alone(self):
+        link = self.root / "link"
+        with mock.patch("os.rmdir") as rmdir, mock.patch("os.unlink") as unlink:
+            take_away_link(link)
+        rmdir.assert_called_once_with(link)
+        unlink.assert_not_called()
+
+    def test_a_link_that_is_gone_already_is_no_error(self):
+        with mock.patch("os.rmdir", side_effect=FileNotFoundError), mock.patch("os.unlink", side_effect=FileNotFoundError):
+            take_away_link(self.root / "gone")
+
+    def test_the_cleanup_of_make_folder_link_takes_the_link_away_and_leaves_the_folder_it_led_to(self):
+        (self.root / "real").mkdir()
+        (self.root / "real" / "file.txt").write_bytes(b"x")
+        link = self.root / "link"
+        probe = unittest.TestCase()  # a test of its own, so that its cleanups can be run here
+        try:
+            make_folder_link(probe, link, self.root / "real")
+        except unittest.SkipTest:
+            self.skipTest("this system does not let the test make a link to a folder")
+        self.assertTrue(os.path.lexists(link))
+        probe.doCleanups()
+        self.assertFalse(os.path.lexists(link))
+        self.assertEqual((self.root / "real" / "file.txt").read_bytes(), b"x")
 
 
 if __name__ == "__main__":
