@@ -1,8 +1,8 @@
 """A folder of Markdown tickets kept in step with Jira: look (diff), bring Jira in (pull), send what you edited (push).
 
-Jira leads. Nothing is ever deleted, nothing is created in Jira (`import-md` does that), and a field that was edited here is not
-overwritten by a pull, nor a field that changed in Jira by a push, unless the person says so with --force. Each field is judged for
-itself: an edit of one field and a change of another in Jira are no conflict.
+Jira leads. Nothing is ever deleted, no issue is created in Jira (`import-md` does that; a push creates links between issues, and never removes
+one), and a field that was edited here is not overwritten by a pull, nor a field that changed in Jira by a push, unless the person says so with
+--force. Each field is judged for itself: an edit of one field and a change of another in Jira are no conflict.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any, Sequence
 
 from ..domain import jql
 from ..domain.branching import slugify
-from ..domain.errors import ConflictError, JiraCliError, NotFoundError, UnavailableError, ValidationError
+from ..domain.errors import AuthError, ConflictError, JiraCliError, NotFoundError, UnavailableError, ValidationError
 from ..domain.fields import ACCEPTANCE, EPIC_LINK, STORY_POINTS
 from ..domain.mirror import (
     BACK,
@@ -20,6 +20,7 @@ from ..domain.mirror import (
     DIFFERS,
     IGNORE_FILE,
     JIRA_CHANGED,
+    LINKS,
     LOCAL_CHANGED,
     MIXED,
     NO_SUCH_FIELD,
@@ -31,6 +32,7 @@ from ..domain.mirror import (
     apply_remote,
     carries,
     classify,
+    file_links,
     local_managed,
     new_file,
     placeholders_in,
@@ -39,6 +41,7 @@ from ..domain.mirror import (
     stamp,
     update_payload,
 )
+from ..domain.mirror_links import entries_of, new_link, plan_links, resolve_type
 from ..domain.model import Issue, parse_issue_key
 from ..domain.privacy import hide_users
 from .issues import fetch_all, require_project
@@ -46,7 +49,7 @@ from .ports import Clock, Files, JiraGateway
 from .settings import Settings
 from .writing import UpdateIssueFromPayload
 
-SYNC_FIELDS = ("summary", "issuetype", "priority", "labels", "components", "fixVersions", "description", "updated", EPIC_LINK, STORY_POINTS, ACCEPTANCE)
+SYNC_FIELDS = ("summary", "issuetype", "priority", "labels", "components", "fixVersions", "description", "updated", EPIC_LINK, STORY_POINTS, ACCEPTANCE, "issuelinks")
 ONLY_JIRA, ONLY_LOCAL, DUPLICATE, UNREADABLE = "only-jira", "only-local", "duplicate", "unreadable"
 STATES = (SAME, DIFFERS, JIRA_CHANGED, LOCAL_CHANGED, MIXED, CONFLICT, ONLY_JIRA, ONLY_LOCAL, DUPLICATE, UNREADABLE)
 # What `pull` says to a person whose edit of nothing but the spacing is neither sent nor released: both ways end the edit.
@@ -345,6 +348,37 @@ class PullMirror:
 
 
 @dataclass
+class LinkAction:
+    """A link that a push creates (a dry run: would create): as the file writes it, as Jira shows it, and the request that creates it."""
+
+    entry: str
+    relation: str
+    type_name: str
+    payload: dict[str, Any]
+
+
+@dataclass
+class _LinkWork:
+    actions: list[LinkAction] = field(default_factory=list)
+    jira_only: list[str] = field(default_factory=list)  # links that Jira holds and the file does not list
+
+    @property
+    def note(self) -> str:
+        return f"{', '.join(self.jira_only)}: jira has it; remove it in Jira (the CLI deletes no link)" if self.jira_only else ""
+
+
+@dataclass
+class _Sending:
+    """What a push is about to do for one file: the fields it sends (`links` among them when the links differ), the request that changes the
+    issue, the links to create and what to tell the person."""
+
+    fields: list[str]
+    payload: dict[str, Any] | None
+    links: _LinkWork
+    said: str
+
+
+@dataclass
 class PushOutcome:
     key: str
     action: str  # pushed | unchanged | refused
@@ -353,6 +387,9 @@ class PushOutcome:
     payload: dict[str, Any] | None = None
     dry_run: bool = False
     message: str = ""
+    links: list[LinkAction] = field(default_factory=list)  # the links created (a dry run: that would be created)
+    jira_only_links: list[str] = field(default_factory=list)  # links that Jira holds and the file does not list: the CLI never removes one
+    error: JiraCliError | None = None  # a write that failed after another one went through: the run ends with this error
 
 
 @dataclass
@@ -411,10 +448,13 @@ class PushMirror:
         for path, mirror in selected:
             name = self._files.name(path)
             try:
-                outcomes.append(self._one(path, name, mirror, ids, force, dry_run))
+                outcome = self._one(path, name, mirror, ids, force, dry_run)
             except JiraCliError as error:
                 outcomes.append(PushOutcome(mirror.key, "refused", name, message=error.message, dry_run=dry_run))
                 return PushResult(outcomes, error)
+            outcomes.append(outcome)
+            if outcome.error is not None:
+                return PushResult(outcomes, outcome.error)
         return PushResult(outcomes)
 
     def _one(self, path: str, name: str, mirror: MirrorFile, ids: dict[str, str | None], force: bool, dry_run: bool) -> PushOutcome:
@@ -461,17 +501,106 @@ class PushMirror:
                     f"The description of {key} holds {', '.join(named)}, which Markdown cannot carry unchanged: sending the file's text would change more than you edited.",
                     hint="Change that description in Jira, or --force to send the file's text anyway.",
                 )
-        payload = update_payload(sending, local, ids)
-        said = "; ".join(part for part in (meanwhile, left_out) if part)
+        fields_sent = [name_ for name_ in sending if name_ != LINKS]
+        payload = update_payload(fields_sent, local, ids) if fields_sent else None
+        links = self._links_to_create(mirror, issue, name) if LINKS in sending else _LinkWork()
+        said = "; ".join(part for part in (meanwhile, left_out, links.note) if part)
+        if payload is None and not links.actions:  # all that is left is a link that only Jira holds, and nothing can be done about it from here
+            return PushOutcome(key, "unchanged", name, [LINKS], message=said, dry_run=dry_run, jira_only_links=links.jira_only)
         if dry_run:
-            return PushOutcome(key, "pushed", name, sending, payload, True, said)
-        self._update.execute(key, payload, dry_run=False, if_unchanged_since=issue.updated)
+            shown = fields_sent + ([LINKS] if links.actions else [])
+            return PushOutcome(key, "pushed", name, shown, payload, True, said, links.actions, links.jira_only)
+        return self._send(path, name, mirror, issue, local, skipped, _Sending(sending, payload, links, said))
+
+    def _links_to_create(self, mirror: MirrorFile, issue: Issue, name: str) -> _LinkWork:
+        """What the push does about the links, checked before anything is sent: a link that only the file lists is created if its type exists and
+        the other issue exists (and not if Jira holds it already); a link that only Jira holds is named, never removed."""
+        plan = plan_links(file_links(mirror), entries_of(issue))
+        jira_only = [entry.text() for entry in plan.jira_only]
+        if not plan.create:
+            return _LinkWork([], jira_only)
         try:
-            fresh = hide_users(self._gateway.get_issue(key, fields=SYNC_FIELDS))
-            stamp(mirror, local, remote_managed(fresh, skipped), self._engine.now(), sending)
-            self._files.write_text(path, mirror.render())
+            types = self._gateway.list_link_types()
+        except NotFoundError:
+            raise NotFoundError(
+                f"{name}: Jira has no link types (HTTP 404): issue linking seems to be disabled, so no link can be created.",
+                hint="A Jira administrator turns issue linking on in the administration.",
+            ) from None
+        checked: set[str] = set()
+        actions: list[LinkAction] = []
+        for entry in plan.create:
+            try:
+                link_type = resolve_type(types, entry.type_name)
+            except ValidationError as error:
+                raise ValidationError(f"{name}: {entry.text()}: {error.message}", hint=error.hint) from None
+            if entry.key not in checked:
+                self._check_exists(entry.key, f"{name}: {entry.text()}")
+                checked.add(entry.key)
+            new = new_link(mirror.key, entry, link_type)
+            actions.append(LinkAction(entry.text(), new.relation, new.type_name, new.payload))
+        return _LinkWork(actions, jira_only)
+
+    def _check_exists(self, key: str, where: str) -> None:
+        try:
+            self._gateway.get_issue(key, fields=["summary"])
+        except NotFoundError:
+            raise NotFoundError(f"{where}: {key} does not exist in Jira, or you may not see it: nothing was sent.", hint="Check the key in the links line.") from None
+
+    def _send(self, path: str, name: str, mirror: MirrorFile, issue: Issue, local: Managed, skipped: dict[str, str], todo: _Sending) -> PushOutcome:
+        """Write the fields first, guarded against a change of the issue since it was read (a link changes the issue too), then the links one by
+        one, and note in the file what the two agree on now."""
+        key, said = mirror.key, todo.said
+        if todo.payload is not None:
+            self._update.execute(key, todo.payload, dry_run=False, if_unchanged_since=issue.updated)
+        created: list[LinkAction] = []
+        failure: JiraCliError | None = None
+        for action in todo.links.actions:
+            try:
+                self._gateway.create_link(action.payload)
+            except JiraCliError as error:
+                failure = _link_refused(error, action)
+                break
+            created.append(action)
+        if failure is not None and todo.payload is None and not created:
+            raise failure  # nothing went through: a refusal like any other
+        if failure is not None:
+            left = ", ".join(action.entry for action in todo.links.actions[len(created) :])
+            said = "; ".join(part for part in (f"links not created ({left}): {failure.message}", said) if part)
+        fields = [name_ for name_ in todo.fields if name_ != LINKS]
+        try:
+            fresh = remote_managed(hide_users(self._gateway.get_issue(key, fields=SYNC_FIELDS)), skipped)
+            settled, edit = list(fields), []
+            if LINKS in todo.fields and failure is None and local.values.get(LINKS) == fresh.values.get(LINKS):
+                settled.append(LINKS)
+            elif created:
+                # The links that were made are Jira's now, but what is left to do is still an edit made here: it must not turn into a conflict.
+                settled.append(LINKS)
+                edit.append(LINKS)
+            if settled:
+                stamp(mirror, local, fresh, self._engine.now(), settled, edit)
+                self._files.write_text(path, mirror.render())
         except (JiraCliError, OSError) as error:  # Jira holds the change by now: it is not "refused"; the next pull notes the state
             reason = getattr(error, "message", "") or str(error)
             failed = f"Jira holds the change, but the file could not be brought up to date ({reason}): `jira pull` notes the new state"
-            return PushOutcome(key, "pushed", name, sending, payload, message="; ".join(part for part in (failed, said) if part))
-        return PushOutcome(key, "pushed", name, sending, payload, message=said)
+            said = "; ".join(part for part in (failed, said) if part)
+        sent = fields + ([LINKS] if created else [])
+        return PushOutcome(key, "pushed", name, sent, todo.payload, message=said, links=created, jira_only_links=todo.links.jira_only, error=failure)
+
+
+def _link_refused(error: JiraCliError, action: LinkAction) -> JiraCliError:
+    """Say what a refusal to create a link means. The 11.3 reference answers 401 (and in practice 403) when the Link Issues permission is missing
+    and 404 when linking is disabled or an issue is not visible; the token was accepted for the reads of this very push, so it is not the token."""
+    if isinstance(error, AuthError):
+        return AuthError(
+            f"{action.relation}: {error.message}",
+            hint="Creating a link needs the 'Link Issues' permission in the project of this issue, and Browse Projects for the other one; Jira answers HTTP 401 or 403 "
+            "when it is missing (the token was accepted for the reads before). Ask a Jira administrator.",
+            details={**error.details, "link": action.entry},
+        )
+    if isinstance(error, NotFoundError):
+        return NotFoundError(
+            f"{action.relation}: {error.message}",
+            hint="Issue linking may be disabled in this Jira, or one of the issues is not visible to you. `jira link-types` lists the link types.",
+            details={**error.details, "link": action.entry},
+        )
+    return error

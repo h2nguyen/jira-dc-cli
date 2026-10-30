@@ -107,6 +107,7 @@ class DocumentationTest(unittest.TestCase):
         known = {command.name for command in all_commands()} | {alias for command in all_commands() for alias in command.aliases}
         pattern = re.compile(r"(?<![\w/-])jira ([a-z][a-z-]*)\b")
         allowed_words = {"is", "the", "and", "a", "to", "in", "or", "for", "cli", "dc", "program", "can", "as", "does", "when", "of", "with", "from", "that", "not"}
+        allowed_words |= {"has"}  # the wording of a message that `push` prints (`jira has it; remove it in Jira`), quoted in the sync guide
         for path in check_release.documents():
             text = path.read_text(encoding="utf-8")
             for block in re.findall(r"```(?:bash|text|sh)?\n(.*?)```", text, re.DOTALL):

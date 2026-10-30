@@ -8,7 +8,7 @@ from .....domain.errors import UsageError
 from ..runtime import Context
 from ..spec import Arg, Command, Example
 from ._common import POWERSHELL_JSON_NOTE, fields_json_option, pretty, text_option
-from .workflow import DRY_RUN, WIKI, write_text
+from .workflow import DRY_RUN, WIKI, report_warnings, write_text
 
 if TYPE_CHECKING:
     from .....application.imports import BatchImport, ImportOutcome
@@ -48,6 +48,7 @@ def run_create(ctx: Context, args: argparse.Namespace) -> int:
         fields=fields_json_option(ctx, args.fields_json),
     )
     result = ctx.app.create_issue.execute(draft, dry_run=args.dry_run, refresh_metadata=args.refresh_metadata)
+    report_warnings(ctx, result.warnings)
     ctx.print_json(result) if ctx.json_mode else ctx.print(_created_text(result))
     return 0
 
@@ -57,6 +58,7 @@ def run_create_json(ctx: Context, args: argparse.Namespace) -> int:
 
     payload = parse_json_object(ctx.read_input(args.file), args.file)
     result = ctx.app.create_issue_from_payload.execute(payload, dry_run=args.dry_run)
+    report_warnings(ctx, result.warnings)
     ctx.print_json(result) if ctx.json_mode else ctx.print(_created_text(result))
     return 0
 
@@ -150,7 +152,9 @@ COMMANDS = (
         when="Use to create one issue after the person has asked for it. Dry-run first, show the payload, and record the key that "
         "Jira returns: never guess a key.",
         description="The project defaults to the current project (`jira use`). The issue type is resolved by name (case-insensitive) or "
-        "id against the types the project can create. The reporter defaults to JIRA_REPORTER, else to the token's user.",
+        "id against the types the project can create. The reporter defaults to JIRA_REPORTER, else to the token's user. The dry run "
+        "checks the priority, components and fix versions against what the project allows (exit code 6, and the allowed values, when "
+        "one is not) and warns about a required field that the options leave out.",
         args=(
             Arg(("--project",), "Project key.", metavar="KEY"),
             Arg(("--type",), "Issue type name or id, for example Story.", metavar="NAME|ID"),
@@ -161,7 +165,11 @@ COMMANDS = (
             WIKI,
             Arg(("--labels",), "Labels.", metavar="a,b"),
             Arg(("--priority",), "Priority, for example High.", metavar="NAME"),
-            Arg(("--assignee",), "Assignee user name.", metavar="USER"),
+            Arg(
+                ("--assignee",),
+                "Assignee: a user name, display name or e-mail address (one user: ambiguity is refused), me, unassigned or automatic.",
+                metavar="USER",
+            ),
             Arg(("--components",), "Components (they must exist).", metavar="a,b"),
             Arg(("--fix-versions",), "Fix versions (they must exist).", metavar="a,b"),
             Arg(("--fields-json",), "Any other field as JSON, or @FILE, for example custom fields. A field that has its own option (project, type, summary, reporter, ...) cannot be set here too.", metavar="JSON|@FILE"),
@@ -176,7 +184,7 @@ COMMANDS = (
         notes=(POWERSHELL_JSON_NOTE,),
         writes=True,
         json_output=True,
-        output="action, key, payload, dryRun, created{id,key,url}.",
+        output="action, key, payload, dryRun, created{id,key,url}, warnings.",
         handler=run_create,
     ),
     Command(
@@ -185,7 +193,8 @@ COMMANDS = (
         summary="Create one issue from a JSON payload",
         when="Use to create one issue from a JSON payload when `create` has no option for a field. Dry-run first.",
         description="Sends a complete Jira payload: an object with a \"fields\" object (project, issuetype, summary, ...). "
-        "Use `jira create --dry-run` to see what a payload looks like.",
+        "Use `jira create --dry-run` to see what a payload looks like. The dry run checks the standard fields against what the project "
+        "allows when the payload names the project by key and the issue type by id.",
         args=(
             Arg(("file",), "JSON file (`-` is standard input).", required=True, metavar="PAYLOAD.json"),
             Arg(("--dry-run",), "Validate and print the payload, send nothing.", kind="flag"),
@@ -193,7 +202,7 @@ COMMANDS = (
         examples=(Example("jira create-json payload.json --dry-run"),),
         writes=True,
         json_output=True,
-        output="action, key, payload, dryRun, created{id,key,url}.",
+        output="action, key, payload, dryRun, created{id,key,url}, warnings.",
         handler=run_create_json,
     ),
     Command(

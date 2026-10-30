@@ -74,7 +74,7 @@ class DispatchTest(unittest.TestCase):
             self.assertIn("daily-workflow", run_cli(alias).out)
 
     def test_unknown_options_and_bad_values_are_usage_errors(self):
-        for argv in (("issue", "PROJ-1", "--nope"), ("issues", "--limit", "many"), ("branch", "PROJ-1", "--type", "release"), ("issue", "PROJ-1", "PROJ-2")):
+        for argv in (("issue", "PROJ-1", "--nope"), ("issues", "--limit", "many"), ("branch", "PROJ-1", "--type", "release")):
             with self.subTest(argv=argv):
                 self.assertEqual(run_cli(*argv).code, 2)
 
@@ -97,7 +97,8 @@ class CatalogTest(unittest.TestCase):
         issue = next(item for item in self.catalog["commands"] if item["name"] == "issue")
         self.assertTrue(issue["supportsJson"])
         self.assertFalse(issue["changesData"])
-        self.assertEqual([arg["names"][0] for arg in issue["arguments"]], ["key", "--comments", "--with-users", "--raw"])
+        self.assertEqual([arg["names"][0] for arg in issue["arguments"]][:4], ["keys", "--comments", "--with-users", "--raw"])
+        self.assertEqual({"--only", "--max-chars", "--outline", "--section", "--rendered", "--history"} - {arg["names"][0] for arg in issue["arguments"]}, set())
         self.assertTrue(issue["arguments"][0]["required"])
         self.assertIn("status{name,category}", issue["jsonOutput"])
         transition = next(item for item in self.catalog["commands"] if item["name"] == "transition")

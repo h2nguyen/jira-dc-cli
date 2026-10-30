@@ -179,11 +179,27 @@ def _push_text(outcome: PushOutcome) -> str:
         label = "would push" if outcome.dry_run else "pushed"
         text = f"{label} {outcome.key}{fields} from {outcome.file}"
         if outcome.dry_run:
-            return f"{text}\n{pretty(outcome.payload)}" + (f"\n{outcome.message}" if outcome.message else "")
-        return f"{text}: {outcome.message}" if outcome.message else text
+            shown = [text] + ([pretty(outcome.payload)] if outcome.payload else [])
+            shown += [f"would link  {link.relation}  (type '{link.type_name}')\n{pretty(link.payload)}" for link in outcome.links]
+            return "\n".join(shown) + (f"\n{outcome.message}" if outcome.message else "")
+        text = f"{text}: {outcome.message}" if outcome.message else text
+        return "\n".join([text] + [f"linked {link.relation}" for link in outcome.links])
     if outcome.action == "refused":
         return f"REFUSED {outcome.key} ({outcome.file}): {outcome.message}"
     return f"unchanged {outcome.key} ({outcome.file}): {outcome.message}"
+
+
+def _push_json(outcome: PushOutcome) -> dict[str, Any]:
+    return {
+        "key": outcome.key,
+        "action": outcome.action,
+        "file": outcome.file or None,
+        "fields": outcome.fields,
+        "payload": outcome.payload,
+        "message": outcome.message or None,
+        "links": [{"entry": link.entry, "relation": link.relation, "payload": link.payload} for link in outcome.links],
+        "jiraOnlyLinks": outcome.jira_only_links,
+    }
 
 
 def run_push(ctx: Context, args: argparse.Namespace) -> int:
@@ -195,10 +211,7 @@ def run_push(ctx: Context, args: argparse.Namespace) -> int:
                 "pushed": result.count("pushed"),
                 "unchanged": result.count("unchanged"),
                 "refused": result.count("refused"),
-                "outcomes": [
-                    {"key": o.key, "action": o.action, "file": o.file or None, "fields": o.fields, "payload": o.payload, "message": o.message or None}
-                    for o in result.outcomes
-                ],
+                "outcomes": [_push_json(outcome) for outcome in result.outcomes],
             }
         )
     else:
@@ -222,8 +235,8 @@ COMMANDS = (
         when="Use before you pull or push, or to see whether a folder of Markdown tickets is in step with Jira: it reads Jira and the files and changes "
         "nothing. It says per issue, and per field, whether Jira changed it, you edited the file, both did, or the file was never synced.",
         description="Reads every issue of the project (or the ones named with --issue) and every `*.md` file of the folder that holds a `jira_key` or "
-        "`issue_key` line, and compares what is kept in step: summary, priority, labels, components, fix versions, story points, acceptance criteria and "
-        "the description. Every field is compared with what the file and Jira last agreed on, which the `jira_base` line records (`pull` and `push` write it): "
+        "`issue_key` line, and compares what is kept in step: summary, priority, labels, components, fix versions, story points, acceptance criteria, "
+        "issue links (the `links:` line) and the description. Every field is compared with what the file and Jira last agreed on, which the `jira_base` line records (`pull` and `push` write it): "
         "a field that Jira changed is `jira changed`, one that you edited is `edited here`, an edit of one field and a change of another make `both sides` "
         "(no conflict), the same field changed on both sides is a `conflict`, and a field that differs where nothing was ever agreed is `differs`. "
         "Files and issues listed in `jira-sync-ignore.txt`, files of another project and files without a key are left out and said so with --json.",
@@ -239,6 +252,8 @@ COMMANDS = (
         ),
         notes=(
             "Not compared on purpose: assignee, status, sprint and comments (people are not mirrored, and the rest changes too often).",
+            "The links of an issue are one line of the file, `links: Blocks -> PROJ-2, Blocks <- PROJ-3`: the link type's name, then `->` when this issue is the outward end "
+            "(it blocks PROJ-2) or `<-` when it is the inward end (PROJ-3 blocks it), then the other key. A link only the file lists is `edited here`, one only Jira holds is `jira changed`.",
             "A file that says `mirror: sanitized`, or whose text holds a relative link (outside code; a link to an issue key, and an attached image (`!shot.png!` in Jira's markup), are no relative link), is compared without its description. "
             "A list that holds a name with a comma (a component `Data, Quality`) is not compared either: a line of comma separated names cannot write it. The ones left out are named on standard error and with --json.",
             "Blanks and line breaks do not make two texts differ, so an edit of nothing but the spacing is not sent. It still counts as an edit: `pull` does not note it as agreed, and a later change of Jira's text is a conflict, not an overwrite.",
@@ -257,7 +272,7 @@ COMMANDS = (
         "New issues become files, a file that Jira changed is rewritten with --update, and a file you edited is not overwritten without --force. It never changes Jira.",
         description="Writes a file `KEY-slug.md` for every issue that has none (the format `import-md` reads: front matter, then the description as "
         "Markdown), notes the files that already hold what Jira holds (two lines, `jira_base` and `jira_synced`), and with --update rewrites the fields "
-        "that Jira changed and that you did not edit since; your edit of another field stays. The same field changed on both sides is a conflict: nothing "
+        "that Jira changed and that you did not edit since, the `links:` line among them; your edit of another field stays. The same field changed on both sides is a conflict: nothing "
         "of that file is overwritten and the exit code is 3. A field that differs but was never synced is left alone unless you add --force, which lets Jira win. "
         "Nothing is deleted. People are left out: `assignee:` stays empty and mentions, e-mail addresses and personal links are redacted.",
         args=(
@@ -278,6 +293,7 @@ COMMANDS = (
             "The first pull of an existing folder adds `jira_base` and `jira_synced` to every file that is in step: that is what lets the next pull and push tell who changed. Nothing else in such a file changes.",
             "A description that holds something Markdown cannot carry unchanged (a table, a panel, a colour, a macro, a code parameter, a literal star) is written as far as it goes, the file says `lossy:` with what is missing, and `push` will not send that description back.",
             "A file that is rewritten ends up with plain line feeds and without a byte order mark. The issue type and the epic of a file are written when it is made and never changed.",
+            "A file made before the links were kept in step lists none: its issue's links show as `jira changed (links)`, and `--update` writes the `links:` line (`Blocks -> PROJ-2`: this issue blocks PROJ-2; `Blocks <- PROJ-3`: PROJ-3 blocks it). A link that you wrote and have not pushed is an edit and is not overwritten.",
             "A text that you edited in its spacing only agrees with Jira's: `pull` leaves it an edit (`skipped`, with the field in `fields`), so that a later change of Jira's text is a conflict and nothing is overwritten. It says how to end such an edit: put the spacing back, or delete the file's `jira_base` line.",
             "A file that cannot be read, or a key that two files hold, is named in the answer and left alone.",
             "Only the files of the folder are written; Jira is only read.",
@@ -294,7 +310,8 @@ COMMANDS = (
         when="Use to send what you edited in one Markdown file to Jira, after the person has asked for it. It sends only the fields that you changed, refuses "
         "when Jira changed the same field meanwhile (exit code 3), and shows the payload with --dry-run first. Push one issue at a time.",
         description="Compares the file with the issue and sends the fields that you edited since the last sync: summary, priority, labels, components, fix "
-        "versions, story points, acceptance criteria and description (Markdown converted to Jira wiki markup). A field that only Jira changed is not "
+        "versions, story points, acceptance criteria and description (Markdown converted to Jira wiki markup), and creates the links that the `links:` line lists "
+        "and Jira does not hold (type and issue are checked first, and a link is never created twice). A field that only Jira changed is not "
         "reverted. It refuses when the same field changed in Jira (a conflict, exit code 3), when the file was never synced and differs, when a field to be "
         "sent holds a placeholder such as [~user] where Jira "
         "holds personal data, and when the description in Jira does not come back from Markdown unchanged (a table, a panel, a code parameter, a literal star): "
@@ -305,7 +322,7 @@ COMMANDS = (
             Arg(("target",), "One Markdown file, or a folder together with --issue.", required=True, metavar="FILE|DIRECTORY"),
             _ISSUE,
             Arg(("--force",), "Send the file's values for a field that Jira changed too, or that was never synced; a description that Markdown does not carry unchanged is sent too.", kind="flag"),
-            Arg(("--dry-run",), "Show the payload and send nothing.", kind="flag"),
+            Arg(("--dry-run",), "Show the payload, and the request of each link, and send nothing.", kind="flag"),
         ),
         examples=(
             Example("jira push docs/tickets/PROJ-33-audit-trail.md --dry-run", "what would be sent"),
@@ -316,10 +333,13 @@ COMMANDS = (
             "A bullet made with `-` comes back as `*`: the words are the same, but Jira may draw the two bullets differently. That does not stop a description from being sent.",
             "A file that says `mirror: sanitized`, or whose text holds a relative link, does not send its description, and a list with a name that holds a comma is not sent either: the answer names what was left out (`not compared: description`). A file named here is pushed even when `jira-sync-ignore.txt` lists its issue: you chose it.",
             "When Jira holds the change but the file could not be brought up to date, the answer says `pushed` with the reason: the next `pull` notes the new state.",
+            "A link that you removed from the `links:` line but Jira still holds is named (`jira has it; remove it in Jira`), stays `edited here` and blocks no other field: the CLI deletes no link. "
+            "An unknown link type is refused with the names that exist, an unknown issue with exit code 4.",
         ),
         writes=True,
         json_output=True,
-        output="dryRun, pushed, unchanged, refused, outcomes[]: key, action (pushed, unchanged, refused), file, fields[], payload, message.",
+        output="dryRun, pushed, unchanged, refused, outcomes[]: key, action (pushed, unchanged, refused), file, fields[], payload, message, "
+        "links[] (entry, relation, payload: the links created, or with --dry-run to be created), jiraOnlyLinks[] (links that Jira holds and the file does not list).",
         handler=run_push,
     ),
 )

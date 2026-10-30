@@ -24,3 +24,4 @@ Settings come from the environment, then from the config file (`jira config path
 | `JIRA_RETRY` | `2` | Retries of a read request after a network error or HTTP 429/502/503/504. Writes are never retried. |
 | `JIRA_OUTPUT` | `text` | `json` makes every command that supports it print JSON, as if --json was given. Meant for scripts and agents. Example: `json`. |
 | `JIRA_NO_CACHE` | `false` | Do not use the local cache of field and issue type lists. |
+| `JIRA_PROFILE` | (empty) | `agent` is for AI agents: JIRA_HIDE_USERS=true and JIRA_OUTPUT=json become the defaults (a value you set yourself still wins), and informational messages stay off standard error. Example: `agent`. |

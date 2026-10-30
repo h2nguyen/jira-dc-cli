@@ -5,6 +5,7 @@ import argparse
 import math
 from typing import TYPE_CHECKING, Sequence
 
+from .....application.settings import MAX_SECONDS
 from .....domain.errors import UsageError
 from ..render import key_values, table
 from ..runtime import Context
@@ -35,8 +36,8 @@ def run_projects(ctx: Context, args: argparse.Namespace) -> int:
 
 
 def run_projects_admin(ctx: Context, args: argparse.Namespace) -> int:
-    if not math.isfinite(args.timeout) or args.timeout < 1:
-        raise UsageError("--timeout must be a number of seconds, 1 or more.")
+    if not math.isfinite(args.timeout) or not 1 <= args.timeout <= MAX_SECONDS:
+        raise UsageError(f"--timeout must be a number of seconds, from 1 to {MAX_SECONDS}.")
     if args.retry < 0:
         raise UsageError("--retry must be zero or a positive number.")
     result = ctx.app.list_admin_projects.execute(
@@ -79,7 +80,10 @@ def run_project(ctx: Context, args: argparse.Namespace) -> int:
 
 
 def run_metadata(ctx: Context, args: argparse.Namespace) -> int:
-    ctx.print(pretty(ctx.app.show_create_metadata.execute(args.project, args.issue_type_id or "")))
+    if args.key and args.project and args.key.upper() != args.project.upper():
+        raise UsageError(f"Two projects were given: {args.key} and --project {args.project}.", hint="Give the project once.")
+    document = ctx.app.show_create_metadata.execute(args.key or args.project or "", args.issue_type_id or "", issue_type=args.type or "")
+    ctx.print(pretty(document))
     return 0
 
 
@@ -130,13 +134,16 @@ COMMANDS = (
         group=GROUP,
         summary="Show what a project can create",
         when="Use before you create an issue to see which issue types a project accepts and which fields each requires.",
-        description="Without an issue type id it lists the issue types the project can create. With one it returns the create-field "
-        "metadata of that type (which fields exist and which are required). The answer is Jira's own JSON and is always printed as JSON.",
+        description="Without an issue type it lists the issue types the project can create. With one (an id, or a name with --type) it returns the "
+        "create-field metadata of that type (which fields exist, which are required and which values they allow). The answer is Jira's own JSON "
+        "and is always printed as JSON. Without a project the current one is used.",
         args=(
-            Arg(("project",), "Project key.", required=True, metavar="PROJECT_KEY"),
+            Arg(("key",), "Project key.", metavar="PROJECT_KEY"),
             Arg(("issue_type_id",), "Issue type id.", metavar="ISSUE_TYPE_ID"),
+            Arg(("--project",), "Project key, as an option (as in `issues` and `search`). Default: the current project.", metavar="KEY"),
+            Arg(("--type",), "Issue type name or id, as in `search --type`: the same as giving its id.", metavar="TYPE"),
         ),
-        examples=(Example("jira metadata PROJ"), Example("jira metadata PROJ 10200")),
+        examples=(Example("jira metadata PROJ"), Example("jira metadata PROJ 10200"), Example("jira metadata --project PROJ --type Story")),
         json_output=True,
         output="Jira's createmeta document.",
         handler=run_metadata,

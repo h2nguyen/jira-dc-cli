@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import urllib.parse
 from typing import Any, Sequence
 
@@ -28,12 +29,54 @@ from ...domain.model import (
     Transition,
     User,
 )
-from ...domain.privacy import strip_users
+from ...domain.privacy import redact_json, strip_users
 from . import jira_mapper as mapper
 from .http_transport import HttpResponse, HttpTransport
+from .rest_agile import RestAgile
+from .rest_attachments import RestAttachments
+from .rest_collab import RestCollab
+from .rest_comments import RestComments
+from .rest_reading import RestReading
+from .rest_reference import RestReference
+from .rest_users import RestUsers
+from .rest_validation import RestValidation
 
 _FIELDS_TTL = 24 * 3600.0
 _ISSUE_TYPES_TTL = 7 * 24 * 3600.0
+_LONG_QUERY = 3500  # characters of an encoded search query above which the search is sent as a POST: a long `key in (...)` does not fit into a URL
+
+
+def _project_and_type(path: str, request: Any) -> tuple[str, str]:
+    """The project key and issue type id that a rejected request was about, as far as the path and the payload say."""
+    match = re.match(r"^/issue/([A-Za-z][A-Za-z0-9_]*)-\d+", path)
+    fields = request.get("fields") if isinstance(request, dict) else None
+    fields = fields if isinstance(fields, dict) else {}
+    project, kind = fields.get("project"), fields.get("issuetype")  # a payload that is wrong may hold a text where an object belongs
+    key = match.group(1).upper() if match else (str(project.get("key") or "") if isinstance(project, dict) else "")
+    return key, str(kind.get("id") or "") if isinstance(kind, dict) else ""
+
+
+_GENERIC_HINT = "Jira's message above says what it did not accept; `--dry-run` shows the request that would be sent."
+
+
+def _rejected_hint(method: str, path: str, request: Any, response: Any) -> str:
+    """What to do after Jira refused a request: never empty, and never an error of its own (the refusal is what matters). For an issue it
+    names the field and points to `jira metadata`, which lists the values the project allows."""
+    try:
+        errors = response.get("errors") if isinstance(response, dict) else None
+        fields = [str(name) for name in (errors or {})] if isinstance(errors, dict) else []
+        if path.startswith("/issue"):
+            project, type_id = _project_and_type(path, request)
+            where = f"jira metadata {project} {type_id}".strip() if project else "jira metadata PROJECT ISSUE_TYPE_ID"
+            if fields:
+                which = "that field" if len(fields) == 1 else "those fields"
+                return f"Jira names {', '.join(fields)}: check the value of {which} against what the project allows, which `{where}` lists. `--dry-run` checks the standard fields before anything is sent."
+            return f"See what the project accepts with `{where}`; `--dry-run` checks the standard fields before anything is sent."
+        if path.startswith("/search"):
+            return "Check the JQL. `jira fields` lists the field names. Windows PowerShell 5.1 removes double quotes inside an argument: pass the query as --jql '@query.jql'."
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return _GENERIC_HINT
 
 
 def _messages(body: Any) -> str:
@@ -60,7 +103,12 @@ def _without_token(value: Any, token: str) -> Any:
     return value
 
 
-class RestJiraGateway(JiraGateway):
+class RestJiraGateway(
+    RestAttachments, RestAgile, RestComments, RestUsers, RestValidation, RestReading, RestReference, RestCollab, JiraGateway
+):
+    """The Jira port over Jira Data Center's REST API. The calls of a feature area live in the `rest_<area>.py` mixin of that
+    area; they use `_call`, `_transport` and `_settings` of this class."""
+
     def __init__(self, settings: Settings, transport: HttpTransport, cache: Cache) -> None:
         self._settings = settings
         self._transport = transport
@@ -74,12 +122,12 @@ class RestJiraGateway(JiraGateway):
         return path if path.startswith("/rest/") else self._settings.api_path.rstrip("/") + path
 
     def _call(
-        self, method: str, path: str, body: Any = None, *, timeout: float | None = None, retries: int | None = None
+        self, method: str, path: str, body: Any = None, *, timeout: float | None = None, retries: int | None = None, idempotent: bool = False
     ) -> Any:
         payload = None if body is None else json.dumps(body).encode("utf-8")
-        response = self._transport.request(method, self._path(path), body=payload, timeout=timeout, retries=retries)
+        response = self._transport.request(method, self._path(path), body=payload, timeout=timeout, retries=retries, idempotent=idempotent)
         decoded = self._decode(response)
-        self._raise_for_status(response.status, decoded, method, path)
+        self._raise_for_status(response.status, decoded, method, path, body)
         return decoded
 
     @staticmethod
@@ -93,11 +141,12 @@ class RestJiraGateway(JiraGateway):
 
     def _scrub(self, value: Any) -> Any:
         """Jira's explanation of a refusal ends up in our error output. Take the token out in case something
-        in between echoed it, and under the privacy policy the people."""
-        if self._settings.hide_users:
-            value = strip_users(value)
+        in between echoed it, and the personal data out of its text: mentions, addresses and personal links always,
+        the people themselves under the privacy policy."""
+        value = strip_users(value) if self._settings.hide_users else redact_json(value)
         return _without_token(value, self._settings.pat)
-    def _raise_for_status(self, status: int, body: Any, method: str, path: str) -> None:
+
+    def _raise_for_status(self, status: int, body: Any, method: str, path: str, request: Any = None) -> None:
         if 200 <= status < 300:
             return
         body = self._scrub(body)
@@ -136,7 +185,11 @@ class RestJiraGateway(JiraGateway):
                 hint="Try again in a moment; if it stays, tell your Jira administrator.",
                 details=details,
             )
-        raise RejectedError(f"Jira refused the request (HTTP {status}): {reason or 'no explanation'}", details={**details, "jira": body})
+        raise RejectedError(
+            f"Jira refused the request (HTTP {status}): {reason or 'no explanation'}",
+            hint=_rejected_hint(method, shown, request, body),
+            details={**details, "jira": body},
+        )
 
     def _field_ids_param(self, names: Sequence[str]) -> tuple[str, list[str]]:
         """Jira's `fields` parameter for logical and standard names, and the extra names asked for."""
@@ -195,7 +248,13 @@ class RestJiraGateway(JiraGateway):
         query = urllib.parse.urlencode(
             {"jql": jql, "startAt": start_at, "maxResults": max_results, "fields": param}, quote_via=urllib.parse.quote
         )
-        data = self._call("GET", f"/search?{query}")
+        if len(query) > _LONG_QUERY:
+            request: dict[str, Any] = {"jql": jql, "startAt": start_at, "maxResults": max_results}
+            if param:
+                request["fields"] = param.split(",")
+            data = self._call("POST", "/search", request, idempotent=True)  # it only reads: retried like the GET form
+        else:
+            data = self._call("GET", f"/search?{query}")
         ids = self.field_ids()
         raw = list(data.get("issues") or [])
         return SearchPage(

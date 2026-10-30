@@ -57,6 +57,24 @@ class ConfigStoreTest(Folder):
         self.assertFalse(self.store.unset("JIRA_PROJECT"))
         self.assertEqual(self.path.stat().st_mtime_ns, stamp)  # nothing to remove: the file is left alone
 
+    def test_a_file_that_notepad_or_powershell_wrote_is_read_too(self):
+        text = "# Einstellungen für Jira — ß\nJIRA_PROJECT=PROJ\nJIRA_REPORTER='jürgen'\n"
+        wanted = {"JIRA_PROJECT": "PROJ", "JIRA_REPORTER": "jürgen"}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for label, data in (
+            ("UTF-16 with a mark", text.encode("utf-16")),
+            ("UTF-16 without a mark", text.encode("utf-16-le")),
+            ("Windows-1252", text.replace("—", "-").encode("cp1252")),
+            ("UTF-8 with a mark", b"\xef\xbb\xbf" + text.encode("utf-8")),
+        ):
+            with self.subTest(label):
+                self.path.write_bytes(data)
+                self.assertEqual(self.store.load(), wanted)
+        self.path.write_bytes(text.encode("utf-16"))
+        self.store.set("JIRA_RETRY", "1")  # a change writes the file as UTF-8 and keeps the other lines
+        self.assertEqual(self.store.load(), {**wanted, "JIRA_RETRY": "1"})
+        self.assertEqual(self.path.read_bytes().decode("utf-8").splitlines()[0], text.splitlines()[0])
+
     def test_the_shell_style_format_is_read(self):
         self.write("\ufeff# comment\n\nJIRA_PAT=abc123\nexport JIRA_PROJECT=PROJ\nJIRA_CA_BUNDLE='C:/a b/ca.pem'\nJIRA_REPORTER=\"jdoe\"\nJIRA_X=value # note\nJIRA_Y=a\\ b\n  JIRA_Z=z\n")
         self.assertEqual(

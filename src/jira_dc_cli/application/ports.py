@@ -22,12 +22,25 @@ from ..domain.model import (
     Transition,
     User,
 )
+from .ports_agile import AgilePort
+from .ports_attachments import AttachmentsPort
+from .ports_collab import CollabPort
+from .ports_comments import CommentsPort
+from .ports_reading import ReadingPort
+from .ports_reference import ReferencePort
+from .ports_users import UsersPort
+from .ports_validation import ValidationPort
 
 
-class JiraGateway(ABC):
+class JiraGateway(
+    AttachmentsPort, AgilePort, CommentsPort, UsersPort, ValidationPort, ReadingPort, ReferencePort, CollabPort, ABC
+):
     """Everything the CLI asks of Jira. Field names are the standard Jira ones plus the logical
     names `story_points`, `epic_link`, `sprint` and `acceptance`, which the adapter maps to the
-    custom field ids of the instance."""
+    custom field ids of the instance.
+
+    The operations of a feature area (attachments, agile, comments, ...) are declared in the `ports_<area>.py` file of
+    that area and inherited here, so that this file stays readable."""
 
     @abstractmethod
     def current_user(self) -> User: ...
@@ -134,6 +147,17 @@ class Files(ABC):
     @abstractmethod
     def write_text(self, path: str, text: str) -> None:
         """Creates missing parent folders."""
+
+    @abstractmethod
+    def read_bytes(self, path: str) -> bytes: ...
+
+    @abstractmethod
+    def write_bytes(self, path: str, data: bytes) -> None:
+        """Creates missing parent folders; the file appears whole or not at all."""
+
+    @abstractmethod
+    def file_size(self, path: str) -> int:
+        """The size in bytes of an existing file."""
 
     @abstractmethod
     def append_text(self, path: str, text: str) -> None: ...

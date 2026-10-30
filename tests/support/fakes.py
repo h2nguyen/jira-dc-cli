@@ -27,6 +27,15 @@ from jira_dc_cli.domain.model import (
     User,
 )
 
+from .fakes_agile import FakeAgile
+from .fakes_attachments import FakeAttachments
+from .fakes_collab import FakeCollab
+from .fakes_comments import FakeComments
+from .fakes_reading import FakeReading
+from .fakes_reference import FakeReference
+from .fakes_users import FakeUsers
+from .fakes_validation import FakeValidation
+
 JANE = User("jdoe", "Jane Doe", "jane.doe@example.com")
 STATUS = {
     "To Do": Status("To Do", "new"),
@@ -88,8 +97,9 @@ def default_issues() -> dict[str, Issue]:
     return {issue.key: issue for issue in issues}
 
 
-class FakeGateway(JiraGateway):
-    """A Jira in memory. Every call is recorded in `calls`; `errors` makes a method fail."""
+class FakeGateway(FakeAttachments, FakeAgile, FakeComments, FakeUsers, FakeValidation, FakeReading, FakeReference, FakeCollab, JiraGateway):
+    """A Jira in memory. Every call is recorded in `calls`; `errors` makes a method fail. The calls of a feature area live in
+    the `fakes_<area>.py` mixin of that area, whose state is set up by `_init_<area>` at the end of `__init__`."""
 
     def __init__(self) -> None:
         self.user = JANE
@@ -124,6 +134,17 @@ class FakeGateway(JiraGateway):
         self.page_cap = 2
         self.next_number = 100
         self.search_handler: Callable[[str], Sequence[Issue]] | None = None  # answers a search itself, to test the JQL that was sent
+        for area in (
+            self._init_attachments,
+            self._init_agile,
+            self._init_comments,
+            self._init_users,
+            self._init_validation,
+            self._init_reading,
+            self._init_reference,
+            self._init_collab,
+        ):
+            area()
 
     # -- helpers -----------------------------------------------------------------------------
 
@@ -148,7 +169,7 @@ class FakeGateway(JiraGateway):
 
     def server_info(self) -> dict[str, Any]:
         self._enter("server_info")
-        return {"version": "9.12.0", "deploymentType": "Server"}
+        return {"version": "11.3.12", "deploymentType": "Server"}
 
     def list_fields(self, *, refresh: bool = False) -> list[FieldInfo]:
         self._enter("list_fields", refresh)
@@ -285,30 +306,56 @@ class FakeGateway(JiraGateway):
 
 
 class MemoryFiles(Files):
+    """Files in memory: text in `files`, binary content in `blobs` (a file is in one of them)."""
+
     def __init__(self, files: Mapping[str, str] | None = None) -> None:
         self.files = dict(files or {})
+        self.blobs: dict[str, bytes] = {}
+
+    def _blobs(self) -> dict[str, bytes]:
+        return self.__dict__.setdefault("blobs", {})  # a test subclass may not call __init__
 
     def read_text(self, path: str, encoding: str = "utf-8") -> str:
+        if path not in self.files and path in self._blobs():
+            try:
+                return self._blobs()[path].decode(encoding)
+            except UnicodeDecodeError as error:
+                raise ValidationError(f"{path} is not valid {encoding} text.") from error
         if path not in self.files:
             raise ValidationError(f"Cannot read {path}: No such file")
         text = self.files[path]
         return text.lstrip("\ufeff") if encoding == "utf-8-sig" else text
 
     def write_text(self, path: str, text: str) -> None:
+        self._blobs().pop(path, None)
         self.files[path] = text
+
+    def read_bytes(self, path: str) -> bytes:
+        if path in self._blobs():
+            return self._blobs()[path]
+        if path in self.files:
+            return self.files[path].encode("utf-8")
+        raise ValidationError(f"Cannot read {path}: No such file")
+
+    def write_bytes(self, path: str, data: bytes) -> None:
+        self.files.pop(path, None)
+        self._blobs()[path] = bytes(data)
+
+    def file_size(self, path: str) -> int:
+        return len(self.read_bytes(path))
 
     def append_text(self, path: str, text: str) -> None:
         self.files[path] = self.files.get(path, "") + text
 
     def exists(self, path: str) -> bool:
-        return path in self.files or self.is_dir(path)
+        return path in self.files or path in self._blobs() or self.is_dir(path)
 
     def is_dir(self, path: str) -> bool:
-        return any(name.startswith(path.rstrip("/") + "/") for name in self.files)
+        return any(name.startswith(path.rstrip("/") + "/") for name in [*self.files, *self._blobs()])
 
     def list_matching(self, directory: str, pattern: str) -> list[str]:
         prefix = directory.rstrip("/") + "/"
-        names = [name for name in self.files if name.startswith(prefix) and "/" not in name[len(prefix) :]]
+        names = [name for name in [*self.files, *self._blobs()] if name.startswith(prefix) and "/" not in name[len(prefix) :]]
         return sorted(name for name in names if fnmatch.fnmatch(name[len(prefix) :], pattern))
 
     def join(self, *parts: str) -> str:
@@ -402,6 +449,8 @@ def build_app(
     docs: Docs | None = None,
     diagnostics: Diagnostics | None = None,
     environ: Mapping[str, str] | None = None,
+    cache: Cache | None = None,
+    runtime: Mapping[str, str] | None = None,
 ) -> Application:
     return Application.create(
         settings=settings or DEFAULT_SETTINGS,
@@ -412,5 +461,6 @@ def build_app(
         docs=docs or FakeDocs(),
         diagnostics=diagnostics or RecordingDiagnostics(),
         environ=environ or {},
-        runtime={"version": "1.0.0", "python": "3.13.0"},
+        runtime=runtime or {"version": "1.0.0", "python": "3.13.0"},
+        cache=cache,
     )

@@ -152,6 +152,18 @@ class TransportTest(GatewayTestCase):
         for personal in ("[~jdoe]", "jane.doe", "example.com"):
             self.assertNotIn(personal, shown)
 
+    def test_by_default_too_a_refusal_carries_no_mentions_addresses_or_personal_links(self):
+        text = "The user [~asmith] (asmith@example.com, see https://contoso-my.sharepoint.com/personal/a_b/x) may not edit this."
+        for status, error, times in ((400, RejectedError, 1), (403, AuthError, 1), (404, NotFoundError, 1), (500, UnavailableError, 5)):
+            with self.subTest(status=status):
+                self.jira.fail_next("/rest/api/2/issue/PROJ-1", status, body={"errorMessages": [text], "errors": {"summary": text}}, times=times)
+                with self.assertRaises(error) as caught:
+                    self.gateway.get_issue("PROJ-1")
+                shown = f"{caught.exception.message} {caught.exception.details}"
+                for personal in ("asmith", "example.com", "sharepoint"):
+                    self.assertNotIn(personal, shown)
+                self.assertIn("[~user]", shown)
+
     def test_retries_end(self):
         self.jira.fail_next("/rest/api/2/myself", 503, times=10)
         with self.assertRaises(UnavailableError):
@@ -332,7 +344,7 @@ class FieldsAndCachingTest(GatewayTestCase):
         self.assertEqual(self.gateway.create_metadata("PROJ", "10200")["values"][0]["fieldId"], "summary")
 
     def test_server_info(self):
-        self.assertEqual(self.gateway.server_info()["version"], "9.12.0")
+        self.assertEqual(self.gateway.server_info()["version"], "11.3.12")
 
     def test_a_custom_field_from_the_settings_replaces_the_catalog_lookup(self):
         settings = dataclasses.replace(self.settings, epic_link_field="customfield_10002")

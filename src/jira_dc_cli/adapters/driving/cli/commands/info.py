@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-from typing import Mapping
+import urllib.parse
+from typing import Any, Mapping, Sequence
 
+from .....domain.compat import TARGET
 from .....domain.errors import UsageError
 from .....version import __version__
-from ..help import catalog, mcp_tools, render_command_help, render_overview
+from ..help import catalog, mcp_tools, render_brief, render_command_help, render_overview
 from ..render import table
 from ..runtime import Context
 from ..spec import Arg, Command, Example
@@ -28,6 +30,11 @@ def _registry():
 
 def run_help(ctx: Context, args: argparse.Namespace) -> int:
     registry = _registry()
+    if args.brief:
+        if args.command:
+            raise UsageError("--brief lists every command: give no command name.", hint="Use `jira help COMMAND` for one command.")
+        ctx.print(render_brief(registry.all_commands()))
+        return 0
     if not args.command:
         ctx.print(render_overview(registry.all_commands(), __version__))
         return 0
@@ -55,7 +62,9 @@ def run_commands(ctx: Context, args: argparse.Namespace) -> int:
 
 def run_version(ctx: Context, args: argparse.Namespace) -> int:
     if ctx.json_mode:
-        ctx.print_json({"name": "jira-dc-cli", "version": __version__, "python": sys.version.split()[0], "platform": sys.platform})
+        ctx.print_json(
+            {"name": "jira-dc-cli", "version": __version__, "python": sys.version.split()[0], "platform": sys.platform, "jiraDataCenter": TARGET}
+        )
     else:
         ctx.print(f"jira-dc-cli {__version__}")
     return 0
@@ -105,6 +114,12 @@ def run_wiki(ctx: Context, args: argparse.Namespace) -> int:
         raise UsageError("Pass a Markdown file, or pipe the Markdown in.", hint="Example: jira wiki notes.md  or  cat notes.md | jira wiki -")
     text = ctx.read_input(args.file or "-")
     ctx.out.write(ctx.app.convert_markdown.execute(text).rstrip("\n") + "\n")
+    if args.check:
+        problems = ctx.app.convert_markdown.check(text)
+        for line, message in problems:
+            ctx.diagnostics.warn(f"line {line}: {message}")
+        if not problems:
+            ctx.diagnostics.info("check: no markup found that Jira is known not to render")
     return 0
 
 
@@ -123,15 +138,46 @@ def _api_path(path: str, environ: Mapping[str, str]) -> str:
     return path
 
 
+def _with_params(path: str, params: Sequence[str]) -> str:
+    """The path with `--param KEY=VALUE` added to its query string, URL-encoded: no `&` has to survive the shell."""
+    if not params:
+        return path
+    base, _, query = path.partition("?")
+    pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    for item in params:
+        key, separator, value = item.partition("=")
+        if not separator or not key:
+            raise UsageError(f"--param needs KEY=VALUE, not '{item}'.", hint="Example: --param projectKeyOrId=PROJ")
+        pairs.append((key, value))
+    return f"{base}?{urllib.parse.urlencode(pairs)}"
+
+
+def _query_of(path: str) -> dict[str, Any]:
+    """The query string of a path as an object: a name that occurs once has its value, a name that repeats a list."""
+    query: dict[str, Any] = {}
+    for key, value in urllib.parse.parse_qsl(path.partition("?")[2], keep_blank_values=True):
+        if key not in query:
+            query[key] = value
+        elif isinstance(query[key], list):
+            query[key].append(value)
+        else:
+            query[key] = [query[key], value]
+    return query
+
+
 def run_api(ctx: Context, args: argparse.Namespace) -> int:
     body = ctx.read_input(args.data_file) if args.data_file else (args.data or "")
-    result = ctx.app.raw_api.execute(args.method, _api_path(args.path, ctx.environ), body, write=args.write, dry_run=args.dry_run)
+    path = _with_params(_api_path(args.path, ctx.environ), args.param or [])
+    result = ctx.app.raw_api.execute(args.method, path, body, write=args.write, dry_run=args.dry_run)
     if result.dry_run:
+        if ctx.json_mode:
+            ctx.print_json({"dryRun": True, "method": result.method, "path": result.path.partition("?")[0], "query": _query_of(result.path), "body": result.body})
+            return 0
         ctx.print(f"Dry run: {result.method} {result.path}; nothing was sent")
         if result.body is not None:
             ctx.print(pretty(result.body))
     elif result.response is not None:
-        ctx.print(pretty(result.response))
+        ctx.print_json(result.response) if ctx.json_mode else ctx.print(pretty(result.response))
     return 0
 
 
@@ -140,9 +186,13 @@ COMMANDS = (
         name="help",
         group=GROUP,
         summary="Show the commands, or the help of one command",
-        when="Use to read the options and the examples of one command.",
-        args=(Arg(("command",), "Command name.", metavar="COMMAND"),),
-        examples=(Example("jira help"), Example("jira help transition")),
+        when="Use to read the options and the examples of one command. `--brief` lists every command with its arguments and main options in a few lines: "
+        "read it once instead of the help of each command.",
+        args=(
+            Arg(("command",), "Command name.", metavar="COMMAND"),
+            Arg(("--brief",), "One line per command with its arguments and main options, in at most 4 KB, instead of the overview.", kind="flag"),
+        ),
+        examples=(Example("jira help"), Example("jira help transition"), Example("jira help --brief")),
         needs_app=False,
         handler=run_help,
     ),
@@ -156,11 +206,11 @@ COMMANDS = (
         "parsing help text. With --format mcp it prints the commands an agent may use as tool descriptions in the shape of an MCP `tools/list` "
         "answer: a name, a description that begins with when to use it, a JSON Schema for the input, annotations (read-only, destructive, "
         "idempotent) and, under `_meta.jira`, how a call becomes a command line. Commands for the person (the token, the settings, the "
-        "current project) and the raw `api` are never listed, and no MCP server comes with the CLI: the descriptions are for a tool-calling "
-        "model, or for a small server of your own.",
+        "current project), the raw `api` and `mcp` itself are never listed. `jira mcp` serves these descriptions as tools to an MCP client; "
+        "they are also for a tool-calling model or a server of your own.",
         args=(
             Arg(("--format",), "table (the default), json (the catalog, as with --json) or mcp (tool descriptions for an agent).", kind="choice", choices=("table", "json", "mcp"), default="table"),
-            Arg(("--only",), "With --format mcp: read (the default: nothing that changes Jira), write or all.", kind="choice", choices=("read", "write", "all"), default="read"),
+            Arg(("--only",), "With --format mcp: read (the default: nothing that changes Jira or writes a file), write (also the file writers) or all.", kind="choice", choices=("read", "write", "all"), default="read"),
         ),
         examples=(
             Example("jira commands --json"),
@@ -176,11 +226,12 @@ COMMANDS = (
         name="version",
         group=GROUP,
         summary="Show the version",
-        when="Use to see which version is installed.",
-        description="Aliases: -V and --version.",
+        when="Use to see which version is installed, and which Jira Data Center release line it is written for.",
+        description="Aliases: -V and --version. The JSON also names the Jira Data Center release line that the CLI is written for and tested "
+        "against (11.3.x); `jira doctor` compares it with your server.",
         examples=(Example("jira version"), Example("jira version --json")),
         json_output=True,
-        output="name, version, python, platform.",
+        output="name, version, python, platform, jiraDataCenter (the release line, such as 11.3.x).",
         needs_app=False,
         handler=run_version,
     ),
@@ -235,8 +286,11 @@ COMMANDS = (
         "comment.",
         description="Prints the Jira wiki markup of a Markdown file (or of standard input). Front matter is dropped. "
         "The same converter runs behind every --wiki option.",
-        args=(Arg(("file",), "Markdown file; `-` or nothing reads standard input.", metavar="FILE.md"),),
-        examples=(Example("jira wiki notes.md"), Example("cat notes.md | jira wiki")),
+        args=(
+            Arg(("file",), "Markdown file; `-` or nothing reads standard input.", metavar="FILE.md"),
+            Arg(("--check",), "Also warn, on standard error, about markup that Jira is known not to render as meant (tables, task lists, HTML, reference links, stray braces).", kind="flag"),
+        ),
+        examples=(Example("jira wiki notes.md"), Example("cat notes.md | jira wiki"), Example("jira wiki notes.md --check")),
         handler=run_wiki,
     ),
     Command(
@@ -250,6 +304,7 @@ COMMANDS = (
         args=(
             Arg(("method",), "GET, POST or PUT.", required=True, metavar="METHOD"),
             Arg(("path",), "Path such as issue/PROJ-1?fields=summary. A leading / is accepted too.", required=True, metavar="PATH"),
+            Arg(("--param",), "A query parameter KEY=VALUE, URL-encoded for you; repeat it. No `&` is needed in the path, which cmd.exe and PowerShell treat specially.", kind="repeat", metavar="KEY=VALUE"),
             Arg(("--data",), "Request body as JSON.", metavar="JSON"),
             Arg(("--data-file",), "Request body from a file (`-` is standard input).", metavar="FILE"),
             Arg(("--write",), "Confirm that a POST or PUT may change Jira.", kind="flag"),
@@ -257,16 +312,16 @@ COMMANDS = (
         ),
         examples=(
             Example("jira api GET 'issue/PROJ-1?fields=summary,status'"),
-            Example("jira api GET rest/agile/1.0/board"),
-            Example("jira api PUT issue/PROJ-1 --data-file payload.json --write --dry-run"),
+            Example("jira api GET rest/agile/1.0/board --param projectKeyOrId=PROJ --param type=scrum"),
+            Example("jira api PUT issue/PROJ-1 --data-file payload.json --write --dry-run --json", "the dry run as one JSON object"),
         ),
         notes=(
             "Git Bash turns an argument that starts with / into a Windows path. The CLI undoes that, but writing the path without the leading / avoids the problem.",
-            "In Windows PowerShell 5.1 pass the body with --data-file: PowerShell removes double quotes inside an argument.",
+            "In Windows PowerShell 5.1 pass the body with --data-file: PowerShell removes double quotes inside an argument. Pass a query with --param instead of `&`.",
         ),
         writes=True,
         json_output=True,
-        output="Jira's response, unchanged (people removed when JIRA_HIDE_USERS=true).",
+        output="Jira's response, unchanged (people removed when JIRA_HIDE_USERS=true); with --dry-run and --json: dryRun, method, path, query{}, body.",
         handler=run_api,
     ),
 )

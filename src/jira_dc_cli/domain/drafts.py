@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 from .errors import ValidationError
 from .model import IssueTypeInfo
@@ -62,7 +62,8 @@ class IssueChanges:
             )
         )
 
-    def to_payload(self) -> dict[str, Any]:
+    def to_payload(self, assignee: dict[str, Any] | None = None) -> dict[str, Any]:
+        """`assignee` is the resolved value of the assignee field (see `UserResolver`); without it the text is taken as the user name."""
         named: dict[str, Any] = {}
         if self.summary is not None:
             named["summary"] = self.summary
@@ -77,7 +78,7 @@ class IssueChanges:
         if self.priority is not None:
             named["priority"] = {"name": self.priority}
         if self.assignee is not None:
-            named["assignee"] = {"name": self.assignee}
+            named["assignee"] = assignee if assignee is not None else {"name": self.assignee}
         return {"fields": _merge(named, self.fields)}
 
 
@@ -105,7 +106,8 @@ class IssueDraft:
         if not self.summary:
             raise ValidationError("A summary is required.", hint="Pass --summary TEXT.")
 
-    def to_payload(self, issue_type_id: str, reporter: str) -> dict[str, Any]:
+    def to_payload(self, issue_type_id: str, reporter: str, assignee: dict[str, Any] | None = None) -> dict[str, Any]:
+        """`assignee` is the resolved value of the assignee field (see `UserResolver`); without it the text is taken as the user name."""
         named: dict[str, Any] = {
             "project": {"key": self.project},
             "reporter": {"name": reporter},
@@ -119,7 +121,7 @@ class IssueDraft:
         if self.priority:
             named["priority"] = {"name": self.priority}
         if self.assignee:
-            named["assignee"] = {"name": self.assignee}
+            named["assignee"] = assignee if assignee is not None else {"name": self.assignee}
         if self.components:
             named["components"] = [{"name": name} for name in self.components]
         if self.fix_versions:
@@ -127,17 +129,25 @@ class IssueDraft:
         return {"fields": _merge(named, self.fields)}
 
 
-def resolve_issue_type(types: list[IssueTypeInfo], query: str) -> IssueTypeInfo:
-    """By id, else by name (case-insensitive). The names are those the project can create."""
+def issue_types_named(types: Sequence[IssueTypeInfo], query: str) -> list[IssueTypeInfo]:
+    """The issue types that a query names: by id, else by name (case-insensitive). The names are those the project can create."""
     wanted = query.strip()
-    matches = [info for info in types if info.id == wanted] or [
-        info for info in types if info.name.casefold() == wanted.casefold()
-    ]
+    return [info for info in types if info.id == wanted] or [info for info in types if info.name.casefold() == wanted.casefold()]
+
+
+FRESH_LIST = "The list was just read from Jira, not from the cache."
+
+
+def resolve_issue_type(types: Sequence[IssueTypeInfo], query: str, *, fresh: bool = False) -> IssueTypeInfo:
+    """By id, else by name (case-insensitive). `fresh` says that `types` was just read from Jira and not from the cache: the hint then
+    says so, because a list that can be a week old might lack a type that an administrator has added since."""
+    wanted = query.strip()
+    matches = issue_types_named(types, wanted)
     if len(matches) == 1:
         return matches[0]
     available = ", ".join(f"{info.name} ({info.id})" for info in sorted(types, key=lambda info: info.name))
     problem = "is ambiguous" if matches else "was not found"
-    raise ValidationError(f"Issue type '{wanted}' {problem}.", hint=f"Available: {available}")
+    raise ValidationError(f"Issue type '{wanted}' {problem}.", hint=f"Available: {available}." + (f" {FRESH_LIST}" if fresh else ""))
 
 
 def validate_update_payload(payload: Any) -> dict[str, Any]:

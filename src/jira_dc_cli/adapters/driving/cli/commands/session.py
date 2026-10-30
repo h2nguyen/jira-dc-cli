@@ -139,24 +139,29 @@ def run_ping(ctx: Context, args: argparse.Namespace) -> int:
 
 
 def run_doctor(ctx: Context, args: argparse.Namespace) -> int:
+    from .....domain.durations import parse_duration
+
     try:
-        checks = ctx.app.doctor.execute()
+        run = ctx.app.doctor.run(quick=args.quick, strict_privacy=args.strict_privacy, cached_for=parse_duration(args.cached, default_unit="m") if args.cached else 0.0)
     except ConfigError as error:  # the settings cannot even be read: that is the finding
         broken = [{"name": "configuration", "status": FAIL, "detail": error.message, "hint": error.hint}]
         if ctx.explicit_json:
-            ctx.print_json({"ok": False, "checks": broken})
+            ctx.print_json({"ok": False, "checks": broken, "cached": False, "cachedAt": None})
         else:
             ctx.print(f"{_MARK[FAIL]} configuration  {error.message}" + (f"\n{' ' * 15}Hint: {error.hint}" if error.hint else ""))
         return 1
+    checks = run.checks
     failed = any(check.status == FAIL for check in checks)
     if ctx.json_mode:
-        ctx.print_json({"ok": not failed, "checks": checks})
+        ctx.print_json({"ok": not failed, "checks": checks, "cached": run.cached, "cachedAt": run.cached_at or None})
     else:
         width = max(len(check.name) for check in checks)
         for check in checks:
             ctx.print(f"{_MARK[check.status]} {check.name.ljust(width)}  {check.detail}")
             if check.hint and check.status != OK:
                 ctx.print(f"{' ' * (len(_MARK[check.status]) + 1 + width + 2)}Hint: {check.hint}")
+        if run.cached:
+            ctx.print(f"Note: nothing was asked of Jira; the connection, server, fields and project checks come from the run of {run.cached_at or 'a moment ago'}.")
     return 1 if failed else 0
 
 
@@ -270,11 +275,22 @@ COMMANDS = (
         summary="Check the setup and say how to fix it",
         when="Use first in a session: it checks the connection, the token, the custom fields and the project, and says how to fix "
         "what fails. When it fails, show the checks to the person and stop.",
-        description="Checks the configuration, the token, TLS, the connection, the server version, the custom fields and the current "
-        "project, and says how to fix what is wrong. Exit code 1 when a check failed.",
-        examples=(Example("jira doctor"), Example("jira doctor --json")),
+        description="Checks the configuration, the token, TLS, where the launcher is, the connection, the server version (the CLI is "
+        "written for Jira Data Center 11.3.x), the custom fields, the current project and the privacy setting, and says how to fix what is "
+        "wrong. Exit code 1 when a check failed. --quick asks Jira at most twice and --cached reuses a recent run.",
+        args=(
+            Arg(("--quick",), "Check only what the local setup says and the connection and the server (two requests at most); leave out the fields and the project.", kind="flag"),
+            Arg(("--cached",), "Reuse the connection, server, fields and project checks of a successful run that is not older (10m, 2h, 90s; a bare number counts in minutes): nothing is asked of Jira, and the answer says so.", metavar="AGE"),
+            Arg(("--strict-privacy",), "Fail (exit code 1) when people can be shown, that is when JIRA_HIDE_USERS is not true.", kind="flag"),
+        ),
+        examples=(
+            Example("jira doctor"),
+            Example("jira doctor --json"),
+            Example("jira doctor --quick --cached 10m --json", "the cheap form for an agent that starts many sessions"),
+            Example("jira doctor --strict-privacy"),
+        ),
         json_output=True,
-        output="ok and checks[{name,status,detail,hint}] with status ok, warn or fail.",
+        output="ok, checks[{name,status,detail,hint}] with status ok, warn or fail, cached (true when the online checks come from an earlier run) and cachedAt (when that run was, or null).",
         handler=run_doctor,
     ),
 )

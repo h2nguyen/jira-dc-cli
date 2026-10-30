@@ -5,6 +5,7 @@ import re
 from dataclasses import replace
 from typing import Any
 
+from .jqlpeople import redact_jql
 from .model import Comment, Issue, IssueRef
 
 # Each pattern is bounded or anchored so that a hostile text of 32,000 characters cannot make it quadratic.
@@ -41,13 +42,52 @@ def looks_like_user(value: Any) -> bool:
 
 
 def strip_users(value: Any) -> Any:
-    """Replace every Jira user object in raw JSON with a marker and redact all text."""
+    """Replace every Jira user object in raw JSON with a marker and redact all text. The two structures that carry a person's name
+    without a user object are cleaned as well: the items of a changelog for a user field, and the JQL of a saved filter."""
     if looks_like_user(value):
         return {"hidden": True}
     if isinstance(value, dict):
-        return {key: strip_users(child) for key, child in value.items()}
+        cleaned = {key: strip_users(child) for key, child in value.items()}
+        _hide_names_of_a_change(value, cleaned)
+        _hide_people_in_a_filter(value, cleaned)
+        return cleaned
     if isinstance(value, list):
         return [strip_users(child) for child in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
+_USER_FIELDS_OF_A_CHANGE = frozenset({"assignee", "reporter", "creator", "watcher", "voter"})
+_VALUES_OF_A_CHANGE = ("from", "to", "fromString", "toString")  # the user key, then the display name
+
+
+def _hide_names_of_a_change(raw: dict[str, Any], cleaned: dict[str, Any]) -> None:
+    """A changelog item for a user field holds the user key (`from`, `to`) and the display name (`fromString`, `toString`)."""
+    if str(raw.get("field", "")).casefold() in _USER_FIELDS_OF_A_CHANGE:
+        for key in _VALUES_OF_A_CHANGE:
+            if raw.get(key):
+                cleaned[key] = None
+
+
+def _hide_people_in_a_filter(raw: dict[str, Any], cleaned: dict[str, Any]) -> None:
+    """The `jql` of a saved filter names people (`assignee = jdoe`, an address in `text ~ "..."`); its `searchUrl` holds the same text,
+    percent-encoded, which no pattern for the plain text finds: the address goes as soon as anything in the JQL had to be redacted."""
+    jql = raw.get("jql")
+    if isinstance(jql, str):
+        redacted = redact_text(redact_jql(jql))
+        if redacted != jql:
+            cleaned["jql"] = redacted
+            if "searchUrl" in cleaned:
+                cleaned["searchUrl"] = ""
+
+
+def redact_json(value: Any) -> Any:
+    """Raw JSON with all text redacted and the objects left as they are (what `strip_users` does for the privacy policy, minus the people)."""
+    if isinstance(value, dict):
+        return {key: redact_json(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [redact_json(child) for child in value]
     if isinstance(value, str):
         return redact_text(value)
     return value
@@ -70,13 +110,14 @@ def hide_users(issue: Issue) -> Issue:
         links=links,
         subtasks=[_redact_ref(ref) for ref in issue.subtasks],
         comments=[hide_comment_author(comment) for comment in issue.comments],
+        attachments=[replace(attachment, author=None) for attachment in issue.attachments],
         extra=strip_users(issue.extra),
         raw=None,
     )
 
 
 def hide_comment_author(comment: Comment) -> Comment:
-    return replace(comment, author=None, body=redact_text(comment.body))
+    return replace(comment, author=None, body=redact_text(comment.body), rendered_body=redact_text(comment.rendered_body))
 
 
 def _redact_ref(ref: IssueRef) -> IssueRef:
@@ -90,6 +131,7 @@ __all__ = [
     "holds_placeholder",
     "looks_like_user",
     "normalize_newlines",
+    "redact_json",
     "redact_text",
     "strip_users",
 ]

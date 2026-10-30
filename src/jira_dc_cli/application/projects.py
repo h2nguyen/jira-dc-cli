@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from ..domain.drafts import resolve_issue_type
 from ..domain.errors import JiraCliError, UsageError
 from ..domain.model import Project, parse_project_key
 from .ports import Diagnostics, JiraGateway
@@ -72,8 +73,18 @@ class ShowProject:
 
 
 class ShowCreateMetadata:
-    def __init__(self, gateway: JiraGateway) -> None:
+    def __init__(self, gateway: JiraGateway, settings: Settings | None = None) -> None:
         self._gateway = gateway
+        self._settings = settings
 
-    def execute(self, project: str, issue_type_id: str = "") -> dict[str, Any]:
-        return self._gateway.create_metadata(parse_project_key(project), issue_type_id.strip())
+    def execute(self, project: str = "", issue_type_id: str = "", *, issue_type: str = "") -> dict[str, Any]:
+        """The create metadata of a project, or of one of its issue types (by id, or by name with `issue_type`)."""
+        chosen = project or (self._settings.project if self._settings else "")
+        if not chosen:
+            raise UsageError("No project given and none selected.", hint="Pass a project key, --project KEY, or run `jira use KEY`.")
+        key = parse_project_key(chosen)
+        if issue_type and issue_type_id.strip():
+            raise UsageError("Use either the issue type id or --type, not both.")
+        if issue_type:
+            issue_type_id = resolve_issue_type(self._gateway.list_issue_types(key), issue_type).id
+        return self._gateway.create_metadata(key, issue_type_id.strip())

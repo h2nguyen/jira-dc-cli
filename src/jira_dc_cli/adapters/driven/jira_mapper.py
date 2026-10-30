@@ -7,6 +7,7 @@ from typing import Any, Iterable, Mapping
 from ...domain.fields import ACCEPTANCE, EPIC_LINK, SPRINT, STORY_POINTS
 from ...domain.model import (
     CATEGORY_NEW,
+    Attachment,
     Comment,
     FieldInfo,
     Issue,
@@ -25,7 +26,7 @@ from ...domain.model import (
 MODELED = frozenset(
     {
         "summary", "issuetype", "status", "priority", "labels", "components", "fixVersions", "description",
-        "created", "updated", "assignee", "reporter", "parent", "issuelinks", "subtasks", "comment",
+        "created", "updated", "assignee", "reporter", "parent", "issuelinks", "subtasks", "comment", "attachment",
     }
 )
 
@@ -75,8 +76,39 @@ def link_from(data: dict[str, Any]) -> IssueLink:
     return IssueLink(_text(link_type.get("name")), _text(link_type.get("inward")), "inward", ref_from(data.get("inwardIssue")))
 
 
+def _visibility(data: Any) -> str:
+    """`role:Developers` or `group:staff` for a restricted comment, else an empty text."""
+    if not isinstance(data, dict) or not data.get("value"):
+        return ""
+    return f"{_text(data.get('type')) or 'role'}:{_text(data.get('value'))}"
+
+
 def comment_from(data: dict[str, Any]) -> Comment:
-    return Comment(_text(data.get("id")), _text(data.get("created")), _text(data.get("body")), user_from(data.get("author")))
+    return Comment(
+        id=_text(data.get("id")),
+        created=_text(data.get("created")),
+        body=_text(data.get("body")),
+        author=user_from(data.get("author")),
+        updated=_text(data.get("updated")),
+        visibility=_visibility(data.get("visibility")),
+        rendered_body=_text(data.get("renderedBody")),
+    )
+
+
+def _whole_number(value: Any) -> int:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def attachment_from(data: dict[str, Any]) -> Attachment:
+    return Attachment(
+        id=_text(data.get("id")),
+        filename=_text(data.get("filename")),
+        mime_type=_text(data.get("mimeType")),
+        size=_whole_number(data.get("size")),
+        created=_text(data.get("created")),
+        author=user_from(data.get("author")),
+        content_url=_text(data.get("content")),
+    )
 
 
 def _names(items: Iterable[Any] | None) -> list[str]:
@@ -96,6 +128,7 @@ def issue_from(data: dict[str, Any], ids: Mapping[str, str | None], extras: Iter
 
     comment = fields.get("comment") or {}
     comments = [comment_from(item) for item in comment.get("comments") or []]
+    attachments = [attachment_from(item) for item in fields.get("attachment") or [] if isinstance(item, dict)]
     parent = fields.get("parent") or {}
     epic = custom(EPIC_LINK)
     acceptance = custom(ACCEPTANCE)
@@ -122,6 +155,8 @@ def issue_from(data: dict[str, Any], ids: Mapping[str, str | None], extras: Iter
         subtasks=[ref_from(task) for task in fields.get("subtasks") or []],
         comments=comments,
         comment_total=int(comment.get("total", len(comments)) or 0),
+        attachments=attachments,
+        attachment_total=len(attachments),
         extra={name: fields[name] for name in extras if name in fields and name not in MODELED},
         raw=data,
     )

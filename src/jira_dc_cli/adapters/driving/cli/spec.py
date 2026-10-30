@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 class Arg:
     names: tuple[str, ...]
     help: str
-    kind: str = "str"  # str | int | float | flag | choice | words (a positional that takes every word that stands there, joined by a space)
+    kind: str = "str"  # str | int | float | flag | choice | words (a positional that takes every word that stands there, joined by a space) | repeat (an option that may be given more than once: its value is a list)
     metavar: str = ""
     default: Any = None
     choices: tuple[str, ...] = ()
@@ -59,6 +59,7 @@ class Command:
     aliases: tuple[str, ...] = ()
     needs_app: bool = True
     when: str = ""  # when to use the command, and when another one is better: for people, and for an agent that picks a tool
+    streams: bool = False  # the command talks on standard input and output itself (a server): its output cannot be wrapped in an envelope
 
     def usage(self) -> str:
         parts = [f"jira {self.name}"]
@@ -74,4 +75,4 @@ class Command:
         return " ".join(parts)
 
 
-GROUP_ORDER = ("Read", "Work on an issue", "Create and import", "Sync with files", "Projects", "Setup and information", "Tools")
+GROUP_ORDER = ("Read", "Work on an issue", "Agile", "Create and import", "Sync with files", "Projects", "Reference", "Setup and information", "Tools")

@@ -16,12 +16,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from jira_dc_cli.adapters.driving.cli.help import commands_markdown, exit_codes_markdown, settings_markdown  # noqa: E402
+from jira_dc_cli.adapters.driving.cli.help import commands_markdown, exit_codes_markdown, render_compact_reference, settings_markdown  # noqa: E402
 from jira_dc_cli.adapters.driving.cli.registry import all_commands  # noqa: E402
 from jira_dc_cli.adapters.driving.cli.spec import GROUP_ORDER  # noqa: E402
 from jira_dc_cli.version import __version__  # noqa: E402
 
 START, END = "<!-- commands:start -->", "<!-- commands:end -->"
+SKILL = ROOT / "skills" / "jira-dc-cli" / "SKILL.md"
+REFERENCE_START, REFERENCE_END = "<!-- reference:start -->", "<!-- reference:end -->"
+SKILL_REFERENCE = ("comment", "api", "create", "update", "pull", "diff")  # the verbs whose flags an agent used `help` for most
 
 
 def command_table() -> str:
@@ -44,6 +47,16 @@ def with_command_table(readme: str) -> str:
     return f"{head}{START}\n\n{command_table()}\n\n{END}{tail}"
 
 
+def with_compact_reference(skill: str) -> str:
+    """The skill carries the arguments and all options of the verbs an agent looked up most, between its markers."""
+    if REFERENCE_START not in skill or REFERENCE_END not in skill:
+        raise SystemExit(f"{SKILL.relative_to(ROOT)} needs the markers {REFERENCE_START} and {REFERENCE_END} around the compact reference.")
+    head, rest = skill.split(REFERENCE_START, 1)
+    _, tail = rest.split(REFERENCE_END, 1)
+    block = render_compact_reference(all_commands(), SKILL_REFERENCE)
+    return f"{head}{REFERENCE_START}\n\n```text\n{block}\n```\n\n{REFERENCE_END}{tail}"
+
+
 def generated() -> dict[Path, str]:
     commands = all_commands()
     files = {
@@ -53,6 +66,7 @@ def generated() -> dict[Path, str]:
     }
     readme = ROOT / "README.md"
     files[readme] = with_command_table(readme.read_text(encoding="utf-8"))
+    files[SKILL] = with_compact_reference(SKILL.read_text(encoding="utf-8"))
     return files
 
 

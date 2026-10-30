@@ -11,6 +11,7 @@ from .spec import GROUP_ORDER, Arg, Command
 _COMMON_OPTIONS = (
     ("--json", "Print the result as JSON (stable keys for scripts and agents)."),
     ("-v, --verbose", "Log every request to stderr (never the token)."),
+    ("--json-envelope", "Print exactly one JSON object on stdout, {\"ok\": true, \"data\": ...} or {\"ok\": false, \"error\": {...}}, whatever happens. The exit code and stderr stay as they are. Also JIRA_JSON_ENVELOPE=1."),
     ("-h, --help", "Show this help. Help never calls Jira and never changes anything."),
 )
 
@@ -61,6 +62,66 @@ def render_overview(commands: Sequence[Command], version: str) -> str:
         "stderr. Exit codes and JSON shapes: `jira how-to exit-codes`, `jira how-to json-output`.",
         "Settings: `jira config show`. Guides: `jira how-to`. Setup check: `jira doctor`.",
     ]
+    return "\n".join(lines)
+
+
+BRIEF_BUDGET = 4096
+_BRIEF_HEADER = (
+    "jira COMMAND ARGS [--options]   [x] optional, x... repeats, * changes data: use --dry-run first where the command has it, ... more options: jira help COMMAND",
+    "Every command also takes -v and --json-envelope; a command that returns data takes --json.",
+)
+
+
+def _brief_line(command: Command, options: int | None) -> str:
+    """`name ARGS --required [--option --option ...]`; a star after the name says that the command changes data. An option that must
+    be given stands outside the brackets and is never cut."""
+    positionals = [(arg.label + ("..." if arg.kind == "words" else "")) if arg.required else f"[{arg.label}{'...' if arg.kind == 'words' else ''}]" for arg in command.args if arg.positional]
+    flags = [arg for arg in command.args if not arg.positional and not (command.writes and arg.names[0] == "--dry-run")]  # the star says it
+    required = [arg.names[0] for arg in flags if arg.required]
+    optional = [arg.names[0] for arg in flags if not arg.required]
+    shown = optional if options is None else optional[:options]
+    text = " ".join([command.name + ("*" if command.writes else ""), *positionals, *required])
+    if shown:
+        text += " [" + " ".join(shown) + (" ..." if len(shown) < len(optional) else "") + "]"
+    elif optional:
+        text += " [...]"
+    return text
+
+
+def render_brief(commands: Sequence[Command], *, budget: int | None = BRIEF_BUDGET, names: Sequence[str] | None = None) -> str:
+    """One line per command with its arguments and options: the compact reference for an agent (`jira help --brief`).
+
+    With a `budget` (characters) the options of every command are cut, step by step, until the text fits; `names` keeps only those
+    commands; with `budget=None` nothing is cut."""
+    chosen = [command for command in commands if names is None or command.name in names]
+
+    def build(options: int | None) -> str:
+        lines = list(_BRIEF_HEADER)
+        for group in GROUP_ORDER:
+            members = [command for command in chosen if command.group == group]
+            if members:
+                lines.append(f"{group}:")
+                lines.extend("  " + _brief_line(command, options) for command in members)
+        return "\n".join(lines)
+
+    text = build(None)
+    for options in (8, 6, 5, 4, 3, 2, 1, 0):
+        if budget is None or len(text) <= budget:
+            break
+        text = build(options)
+    return text
+
+
+def render_compact_reference(commands: Sequence[Command], names: Sequence[str]) -> str:
+    """For the skill: the arguments and all options of some commands, each with its first example."""
+    by_name = {command.name: command for command in commands}
+    lines: list[str] = []
+    for name in names:
+        command = by_name[name]
+        lines.append(_brief_line(command, None))
+        if command.examples:
+            example = command.examples[0]
+            lines.append("    " + example.command + (f"    # {example.note}" if example.note else ""))
     return "\n".join(lines)
 
 
@@ -163,11 +224,27 @@ def catalog(commands: Sequence[Command], version: str) -> dict[str, Any]:
 
 # Commands that are for the person, not for an agent: they hold or change credentials and settings, or describe the CLI itself.
 # `api` is a raw escape hatch whose writes no description can bound; an agent that needs it asks the person.
-MCP_EXCLUDED = frozenset({"setup-pat", "remove-pat", "config", "use", "clear-project", "help", "commands", "skill", "changelog", "api", "wiki"})
+MCP_EXCLUDED = frozenset({"setup-pat", "remove-pat", "config", "use", "clear-project", "help", "commands", "skill", "changelog", "api", "wiki", "mcp"})
 MCP_LOCAL = frozenset({"version", "how-to", "current"})  # they never ask Jira
-MCP_DESTRUCTIVE = frozenset({"update", "update-json", "transition", "import-md", "import-md-dir", "import-csv", "push"})  # they overwrite or move
-MCP_IDEMPOTENT = frozenset({"update", "update-json", "push"})  # the same call again changes nothing more
-MCP_FILES = frozenset({"pull", "export"})  # they change no issue but write files (`pull`, `export --out`) and can overwrite one: not read-only
+MCP_DESTRUCTIVE = frozenset(
+    {
+        "update", "update-json", "transition", "import-md", "import-md-dir", "import-csv", "push",  # they overwrite or move
+        "sprint-add", "rank", "epic-add", "sprint-update",  # they move issues between sprints and epics, change the rank, start and complete sprints
+        "watch", "vote", "remote-link",  # they change who is notified, a vote, a link that may be updated
+        "comment",  # it adds a comment, but with --edit it overwrites the text of one
+        "assign",  # it replaces the assignee
+    }
+)
+MCP_IDEMPOTENT = frozenset({"update", "update-json", "push", "sprint-add", "rank", "epic-add", "sprint-update", "watch", "vote", "assign"})  # the same call again changes nothing more
+MCP_FILES = frozenset({"pull", "export", "download"})  # they change no issue but write local files (`pull`, `export --out`, `download`): not read-only, so they are of the write set, and `jira mcp` offers them only with --allow-files
+# What a tool that writes files says about itself: in the catalogue (`jira commands --format mcp`, for a program that runs `jira NAME` in a shell, where `--force` works) and
+# as `jira mcp` offers it (which refuses `force`, never writes over a file of the export and the download, and keeps to the working folder).
+MCP_FILES_NOTE = "Does not change Jira. Writes files in a folder and can overwrite them: ask before you use it on a folder that holds work."
+MCP_FILES_NOTE_OVER_MCP = (
+    "Does not change Jira. Writes files below the working folder of the server. Over MCP it never replaces a file or an edit of yours: "
+    "`force` is refused, `export` refuses a file that exists, `download` stops at one, and `pull` only adds files and brings in what Jira changed."
+)
+MCP_REFUSED_NOTE = "Refused over MCP: replacing a file, or a change that somebody else made, is for the user, not for a call."
 MCP_ALWAYS = {"issues": ("--no-assignee",), "ping": ("--quiet",)}  # what keeps the people out of an answer that would show them
 MCP_ONLY = ("read", "write", "all")
 _TYPES = {"flag": "boolean", "int": "integer", "float": "number"}
@@ -214,7 +291,14 @@ def _in_tool_terms(text: str, command: Command, names: dict[str, str], tool_name
     return text
 
 
-def mcp_tool(command: Command, tool_names: dict[str, str] | None = None) -> dict[str, Any]:
+def mcp_tool_name(command: Command) -> str:
+    """The name of the tool of a command: `import-md` is `jira_import_md`."""
+    return "jira_" + command.name.replace("-", "_")
+
+
+def mcp_tool(command: Command, tool_names: dict[str, str] | None = None, *, over_mcp: bool = False) -> dict[str, Any]:
+    """The description of one command as a tool. `over_mcp` describes it as `jira mcp` offers it: the server refuses `force` and never writes over
+    a file of an export or a download, which the catalogue (for a shell, where the flag works) does not say."""
     names = mcp_property_names(command)
     tool_names = tool_names or {}
 
@@ -222,6 +306,10 @@ def mcp_tool(command: Command, tool_names: dict[str, str] | None = None) -> dict
         return _in_tool_terms(text, command, names, tool_names)
 
     properties = {names[arg.names[0]]: {**_schema(arg), "description": say(_schema(arg)["description"])} for arg in command.args}
+    forcing = [names[arg.names[0]] for arg in command.args if arg.kind == "flag" and arg.names[0] == "--force"]
+    if over_mcp:
+        for name in forcing:
+            properties[name]["description"] = f"{MCP_REFUSED_NOTE} {properties[name]['description']}"
     required = [names[arg.names[0]] for arg in command.args if arg.required]
     parts = [command.summary + "."]
     if command.when:
@@ -233,7 +321,9 @@ def mcp_tool(command: Command, tool_names: dict[str, str] | None = None) -> dict
     if command.writes:
         parts.append("Changes Jira." + (" Run it with dryRun first and show the result." if any("--dry-run" in a.names for a in command.args) else ""))
     elif command.name in MCP_FILES:
-        parts.append("Does not change Jira. Writes files in a folder and can overwrite them: ask before you use it on a folder that holds work.")
+        parts.append(MCP_FILES_NOTE_OVER_MCP if over_mcp else MCP_FILES_NOTE)
+    if over_mcp and forcing:
+        parts.append(f"Over MCP `{forcing[0]}` is refused: do not set it.")
     writes_files = command.name in MCP_FILES
     annotations: dict[str, Any] = {"title": command.summary, "readOnlyHint": not command.writes and not writes_files, "openWorldHint": command.name not in MCP_LOCAL}
     if command.writes:
@@ -243,7 +333,7 @@ def mcp_tool(command: Command, tool_names: dict[str, str] | None = None) -> dict
         annotations["destructiveHint"] = True
         annotations["idempotentHint"] = True
     return {
-        "name": "jira_" + command.name.replace("-", "_"),
+        "name": mcp_tool_name(command),
         "title": command.summary,
         "description": "\n\n".join(parts),
         "inputSchema": {"type": "object", "properties": properties, "required": required, "additionalProperties": False},
@@ -267,21 +357,24 @@ def mcp_tool(command: Command, tool_names: dict[str, str] | None = None) -> dict
     }
 
 
-def mcp_tools(commands: Sequence[Command], version: str, *, only: str = "read") -> dict[str, Any]:
+def mcp_tools(commands: Sequence[Command], version: str, *, only: str = "read", over_mcp: bool = False) -> dict[str, Any]:
     """The commands an agent may use, as MCP tool descriptions: name, description, JSON Schema for the input, annotations
     (read-only, destructive, idempotent), and under `_meta.jira` how the properties become a command line.
 
-    `only` is `read` (the default: nothing that changes Jira), `write` or `all`."""
+    `only` is `read` (the default: nothing that changes Jira and nothing that writes local files), `write` (the commands that change Jira, and
+    `MCP_FILES`, which write local files) or `all`. `over_mcp` is how `jira mcp` offers them: the same tools, and the texts that differ say
+    what the server does (it refuses `force`, and never writes over a file of an export or a download); the catalogue describes the
+    commands as a shell runs them."""
     if only not in MCP_ONLY:
         raise ValueError(f"only must be one of {MCP_ONLY}")
     chosen = [
         command
         for command in commands
-        if command.name not in MCP_EXCLUDED and (only == "all" or command.writes == (only == "write"))
+        if command.name not in MCP_EXCLUDED and (only == "all" or (command.writes or command.name in MCP_FILES) == (only == "write"))
     ]
-    tool_names = {command.name: "jira_" + command.name.replace("-", "_") for command in chosen}
+    tool_names = {command.name: mcp_tool_name(command) for command in chosen}
     return {
-        "tools": [mcp_tool(command, tool_names) for command in chosen],
+        "tools": [mcp_tool(command, tool_names, over_mcp=over_mcp) for command in chosen],
         "_meta": {
             "jira": {
                 "version": version,
@@ -290,8 +383,8 @@ def mcp_tools(commands: Sequence[Command], version: str, *, only: str = "read") 
                     "Run the command: `jira NAME`, then the positional arguments in the order of `arguments`, then each other property as its flag "
                     "(a boolean only when true), then the always-appended flags. A result is JSON on standard output; "
                     "a failure is a non-zero exit code and JSON on standard error: {\"error\": {\"code\", \"message\", \"hint\", \"exitCode\"}}. "
-                    "People stay out of every answer when the process that runs the commands has JIRA_HIDE_USERS=true: set it for an agent "
-                    "(the lead of a project is shown otherwise)."
+                    "People stay out of the answers when the process that runs the commands has JIRA_HIDE_USERS=true: set it for an agent "
+                    "(the lead of a project is shown otherwise; your own login still appears where a command sets you as reporter or assignee)."
                 ),
                 "exitCodes": [{"code": code, "names": names, "meaning": meaning} for code, names, meaning in EXIT_CODES],
             }

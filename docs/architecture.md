@@ -17,7 +17,7 @@ into a port. That is what makes the program easy to extend and to test, and test
                 | calls use cases                                                ^ implements ports
                 v                                                                |
         +----------------------------------------------------------------------------------+
-        |  application   use cases (ViewIssue, TransitionIssue, ImportMarkdown, ...)        |
+        |  application   use cases (ViewIssue, TransitionWithFields, ImportMarkdown, ...)   |
         |                ports: JiraGateway, ConfigStore, Cache, Files, Clock, Docs, ...     |
         |  +------------------------------------------------------------------------------+ |
         |  |  domain   Issue, Transition, JQL, reporting, privacy, wiki markup, payloads    | |
@@ -32,10 +32,10 @@ into a port. That is what makes the program easy to extend and to test, and test
 
 | Layer | Folder | Holds | May import |
 | --- | --- | --- | --- |
-| Domain | `src/jira_dc_cli/domain/` | Pure rules and data: the model, JQL, branch names, reports, privacy, Markdown to wiki conversion and back (`unwiki`), search terms and snippets, the Markdown ticket file with its sync records (`mirror`), payload builders, the error types with their exit codes. | The domain and the standard library, but nothing that does I/O. |
+| Domain | `src/jira_dc_cli/domain/` | Pure rules and data: the model, JQL, branch names, reports, privacy, Markdown to wiki conversion and back (`unwiki`), search terms and snippets, the Markdown ticket file with its sync records (`mirror`) and its `links:` line (`mirror_links`), payload builders, the error types with their exit codes. | The domain and the standard library, but nothing that does I/O. |
 | Application | `src/jira_dc_cli/application/` | The use cases, the **ports** (abstract interfaces), the settings definitions. | The domain and the application. |
 | Driven adapters | `src/jira_dc_cli/adapters/driven/` | Implementations of the ports: HTTP transport and Jira REST gateway, config file, cache, files, documentation, clock. | Domain, application, `version`. Never a driving adapter. |
-| Driving adapter | `src/jira_dc_cli/adapters/driving/cli/` | The command line: command descriptions, parser, help, output formatting, `main`. | Domain, application, `version`. Never a driven adapter. |
+| Driving adapter | `src/jira_dc_cli/adapters/driving/cli/` | The command line: command descriptions, parser, help, output formatting, `main`; and the MCP server (`mcp_server.py`, `mcp_calls.py`, `mcp_paths.py`). | Domain, application, `version`. Never a driven adapter. |
 | Composition root | `src/jira_dc_cli/bootstrap.py` | Wiring: settings from file and environment, real adapters, `main()`. | Everything. Nothing imports it except the entry points. |
 
 Everything uses the standard library only. `tests/test_architecture.py` reads the imports of every module
@@ -46,10 +46,10 @@ import, a command module that is not registered, a port without a real adapter o
 
 | Port | What the application needs | Real adapter | Test double |
 | --- | --- | --- | --- |
-| `JiraGateway` | Everything Jira: users, fields, issues, search, transitions, comments, links, create, update, projects, raw requests. | `RestJiraGateway` over `HttpTransport` | `FakeGateway`; also `MockJira`, an HTTP server |
+| `JiraGateway` | Everything Jira: users, fields, issues, search, transitions, comments, links, create, update, projects, raw requests; and, in the `ports_<area>.py` files it inherits from, attachments, boards and sprints, users, validation metadata, saved filters, reference lists and collaboration (watchers, votes, worklogs, remote links). Only calls that the Jira Data Center 11.3 REST API reference documents. | `RestJiraGateway` over `HttpTransport` | `FakeGateway`; also `MockJira`, an HTTP server |
 | `ConfigStore` | Persistent `KEY=value` settings. | `FileConfigStore` | `MemoryConfigStore` |
 | `Cache` | Lists that rarely change (fields, issue types). | `FileCache` | `MemoryCache` |
-| `Files` | Read, write, list, join. | `LocalFiles` | `MemoryFiles` |
+| `Files` | Read, write, list, join. `LocalFiles` can also create a file only when nothing is there and give one name to a place (`create_bytes`, `resolve`); the use cases of attachments ask for these through the optional protocols of `application/ports_attachments.py`, and a file system in memory may not have them. | `LocalFiles` | `MemoryFiles` |
 | `Clock` | The current time. | `SystemClock` | `FixedClock` |
 | `Docs` | The documentation and skill that ship with the CLI. | `LocalDocs` | `FakeDocs` |
 | `Diagnostics` | Progress and warnings for the person at the terminal. | `StderrDiagnostics` (in the command line adapter) | `RecordingDiagnostics` |
@@ -64,12 +64,12 @@ something else in another.
 
 1. `main.run` reads the arguments, finds the command in the registry and builds an argparse parser from its
    description (`spec.Command`). `--help` is answered before parsing, so help never needs valid arguments.
-2. The handler in `commands/workflow.py` gets a `Context`: the streams, the output mode and a lazy
-   `Application`. It converts the text options and calls `ctx.app.transition_issue.execute(...)`.
-3. `TransitionIssue` (application) asks the gateway for the issue and the transitions, uses the domain's
-   `pick_transition` to choose one, builds the payload with the domain's `transition_payload`, and either returns
-   it (dry run) or hands that very payload to the `JiraGateway` port, which sends it as it is: what a dry run shows
-   is what a real run sends.
+2. The handler `run_transition` in `commands/workflow.py` gets a `Context`: the streams, the output mode and a lazy
+   `Application`. It converts the text options and calls `ctx.app.validation.transition.execute(...)`.
+3. `TransitionWithFields` (application; the `transition` of `ValidationUseCases`) asks the gateway for the issue and
+   the transitions, uses the domain's `pick_transition` to choose one, builds the payload with the domain's
+   `transition_payload`, and either checks it against the transition's screen and returns it (dry run) or hands that
+   very payload to the `JiraGateway` port, which sends it as it is: what a dry run shows is what a real run sends.
 4. `RestJiraGateway` turns the call into an HTTP request on `HttpTransport` (keep-alive connection, retries for
    reads, TLS), maps the status to a domain error (`NotFoundError`, `AuthError`, ...) and the JSON to domain objects.
 5. The handler prints the result as text or JSON. A `JiraCliError` anywhere on the way ends in `main.run`, which
@@ -132,8 +132,8 @@ The suite runs offline in about half a minute. Run it with `python -m unittest d
 - **JSON is a contract.** Keys are documented, stable within a major version and checked against the docs.
 - **The config file is plain `KEY=value` lines**, read as data and never executed.
 - **Domain objects instead of Jira's JSON** inside the program: when Jira's JSON changes, one mapper changes.
-- **A second Jira backend or another front end is an adapter.** A Jira Cloud gateway implements `JiraGateway`;
-  an MCP server or a small HTTP service would be a second driving adapter that calls the same `Application`.
+- **A second Jira backend or another front end is an adapter.** A Jira Cloud gateway implements `JiraGateway`; another driving adapter calls the
+  same `Application`: an MCP server (`jira mcp`) is one, a small HTTP service would be another.
 - **Search and sync are use cases over the existing ports.** `FindIssues` (words to JQL, loosening, snippets) and
   `DiffMirror`, `PullMirror` and `PushMirror` (a folder and Jira, field by field against a record of the last
   agreement) need nothing but `JiraGateway`, `Files` and `Clock`; the pure parts (search terms, snippets, the
@@ -141,6 +141,9 @@ The suite runs offline in about half a minute. Run it with `python -m unittest d
   with plain strings.
 - **The view for agents is generated, not written.** `jira commands --format mcp` is built from the same `Command`
   description, with its `when` text, that feeds the help and the reference, so the tool descriptions cannot drift.
-  No MCP server ships: a server would be a driving adapter that reads these descriptions and runs the commands.
+  `jira mcp` is that driving adapter (`adapters/driving/cli/mcp_server.py`, `mcp_calls.py`, `mcp_paths.py`): it reads these descriptions, checks a call against the
+  schema of its tool and against the working folder (the tables of `mcp_calls.py` say which property is a path, `mcp_paths.py` enforces it, with the same
+  functions as the commands use to read a path (`domain.attachments.argument_paths`, `application.imports.MAP_HEADER`), so that the check and the use cannot
+  drift apart) and runs the command in the same process on a new `Application` for every call; nothing else depends on it.
 
 How to add a command, a setting or an adapter: [extend the CLI](how-to/extend-the-cli.md).

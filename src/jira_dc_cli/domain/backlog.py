@@ -10,13 +10,7 @@ from typing import Any, Mapping, Sequence
 from .fields import ACCEPTANCE, EPIC_LINK, EXPORT_KEYS, SPRINT, STORY_POINTS
 from .model import Issue
 from .privacy import redact_text
-
-
-def _key_number(issue: Issue) -> int:
-    try:
-        return int(issue.key.rsplit("-", 1)[1])
-    except (IndexError, ValueError):
-        return 0
+from .sprints import key_order
 
 
 def backlog_entry(issue: Issue) -> dict[str, Any]:
@@ -39,7 +33,7 @@ def backlog_entry(issue: Issue) -> dict[str, Any]:
 def build_backlog_dump(
     issues: Sequence[Issue], field_ids: Mapping[str, str | None], fetched_at: str
 ) -> dict[str, Any]:
-    ordered = sorted(issues, key=_key_number)
+    ordered = sorted(issues, key=lambda issue: key_order(issue.key))  # numeric order; an overlong number sorts last in its project
     return {
         "fetchedAt": fetched_at,
         "fieldIds": {EXPORT_KEYS[name]: field_ids.get(name) for name in (EPIC_LINK, STORY_POINTS, ACCEPTANCE, SPRINT)},

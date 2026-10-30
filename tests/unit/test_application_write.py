@@ -1,54 +1,15 @@
-"""Use cases that change Jira: transition, comment, link, update, create and the imports."""
+"""Use cases that change Jira: comment, link, update, create and the imports. The transition lives in test_validation_application."""
 import dataclasses
 import unittest
 
 from jira_dc_cli.domain.drafts import IssueChanges, IssueDraft
-from jira_dc_cli.domain.errors import ConfigError, ConflictError, NotFoundError, ValidationError
+from jira_dc_cli.domain.errors import ConfigError, ConflictError, NotFoundError, RejectedError, ValidationError
+from jira_dc_cli.domain.validation import FieldRule
 from tests.support.fakes import DEFAULT_SETTINGS, FakeGateway, MemoryFiles, RecordingDiagnostics, build_app
 
 
 def settings(**changes):
     return dataclasses.replace(DEFAULT_SETTINGS, **changes)
-
-
-class TransitionTest(unittest.TestCase):
-    def setUp(self):
-        self.gateway = FakeGateway()
-        self.app = build_app(gateway=self.gateway)
-
-    def test_without_a_target_it_lists_the_options(self):
-        result = self.app.transition_issue.execute("PROJ-2")
-        self.assertEqual((result.current_status, [t.id for t in result.options]), ("In Progress", ["111", "81"]))
-        self.assertIsNone(result.chosen)
-        self.assertEqual(self.gateway.called("transition_issue"), [])
-
-    def test_moves_the_issue(self):
-        result = self.app.transition_issue.execute("PROJ-2", to="done", comment=" Shipped. ")
-        self.assertTrue(result.executed)
-        self.assertEqual(
-            self.gateway.called("transition_issue")[0][1:],
-            ("PROJ-2", {"transition": {"id": "81"}, "update": {"comment": [{"add": {"body": "Shipped."}}]}}),
-        )
-        self.assertEqual(self.gateway.issues["PROJ-2"].status.name, "Done")
-        self.assertEqual(result.payload["update"]["comment"][0]["add"]["body"], "Shipped.")
-
-    def test_dry_run_changes_nothing(self):
-        result = self.app.transition_issue.execute("PROJ-2", to="Done", dry_run=True)
-        self.assertTrue(result.dry_run and not result.executed)
-        self.assertEqual(self.gateway.called("transition_issue"), [])
-        self.assertEqual(self.gateway.issues["PROJ-2"].status.name, "In Progress")
-
-    def test_a_comment_needs_a_target(self):
-        with self.assertRaises(ValidationError):
-            self.app.transition_issue.execute("PROJ-2", comment="x")
-
-    def test_unknown_target(self):
-        with self.assertRaises(ValidationError):
-            self.app.transition_issue.execute("PROJ-2", to="Archived")
-
-    def test_unknown_issue(self):
-        with self.assertRaises(NotFoundError):
-            self.app.transition_issue.execute("PROJ-999")
 
 
 class CommentTest(unittest.TestCase):
@@ -72,12 +33,6 @@ class CommentTest(unittest.TestCase):
     def test_empty_comment(self):
         with self.assertRaises(ValidationError):
             self.app.add_comment.execute("PROJ-1", "  \n")
-
-    def test_list_hides_authors_unless_asked(self):
-        self.assertIsNone(self.app.list_comments.execute("PROJ-1")[0].author)
-        self.assertEqual(self.app.list_comments.execute("PROJ-1", with_users=True)[0].author.name, "jdoe")
-        with self.assertRaises(ValidationError):
-            build_app(gateway=self.gateway, settings=settings(hide_users=True)).list_comments.execute("PROJ-1", with_users=True)
 
 
 class LinkTest(unittest.TestCase):
@@ -150,6 +105,319 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.gateway.called("update_issue")[0][2], {"update": {"labels": [{"add": "x"}]}})
         with self.assertRaises(ValidationError):
             self.app.update_issue_from_payload.execute("PROJ-1", {"nothing": 1})
+
+
+STAND_INS_MESSAGE = "which stands in place of a mention or an address that the CLI hides: sending it would overwrite the real one."
+READ_DESCRIPTION = "Ask [~user] or [email]\nSecond line"  # what `jira issue PROJ-1` shows of its description: the people are hidden
+
+
+class UpdateStandInTest(unittest.TestCase):
+    """`jira issue` shows [~user], [email] and [personal link] where Jira holds a mention, an address or a link. An update from that text
+    would overwrite the real one: it is refused, as `comment --edit`, `push` and the imports refuse it."""
+
+    def setUp(self):
+        self.gateway = FakeGateway()
+        self.app = build_app(gateway=self.gateway)
+
+    def update(self, changes, **options):
+        return self.app.update_issue.execute("PROJ-1", changes, **options)
+
+    def assert_refused(self, call, message):
+        with self.assertRaises(ValidationError) as caught:
+            call()
+        self.assertEqual(caught.exception.exit_code, 1)
+        self.assertEqual(caught.exception.message, message)
+        self.assertEqual(self.gateway.called("update_issue"), [])
+        return caught.exception
+
+    def test_the_description_that_was_read_cannot_be_sent_back_with_one_more_line(self):
+        error = self.assert_refused(
+            lambda: self.update(IssueChanges(description=READ_DESCRIPTION + "\nThird line")),
+            f"The new description holds [~user], [email], {STAND_INS_MESSAGE}",
+        )
+        self.assertIn("[~username], see `jira users resolve`", error.hint)
+        self.assertIn("best edited in Jira itself", error.hint)
+        self.assertEqual(error.details, {"fields": ["description"], "placeholders": ["[~user]", "[email]"]})
+        self.assertEqual(self.gateway.issues["PROJ-1"].description, "Ask [~jdoe] or jane.doe@example.com\nSecond line")
+
+    def test_the_dry_run_refuses_it_too_and_so_does_a_guard_that_would_pass(self):
+        message = f"The new description holds [~user], [email], {STAND_INS_MESSAGE}"
+        self.assert_refused(lambda: self.update(IssueChanges(description=READ_DESCRIPTION), dry_run=True), message)
+        self.assert_refused(lambda: self.update(IssueChanges(description=READ_DESCRIPTION), if_unchanged_since="2026-10-10T07:00:00Z"), message)
+
+    def test_the_placeholder_is_refused_before_the_stale_guard_like_in_an_edit_of_a_comment(self):
+        stale = "2026-10-01T00:00:00Z"  # PROJ-1 changed on 2026-10-10: the guard alone would be a conflict
+        self.assert_refused(
+            lambda: self.update(IssueChanges(description=READ_DESCRIPTION), if_unchanged_since=stale),
+            f"The new description holds [~user], [email], {STAND_INS_MESSAGE}",
+        )
+
+    def test_the_summary(self):
+        self.assert_refused(lambda: self.update(IssueChanges(summary="Mail [email] now")), f"The new summary holds [email], {STAND_INS_MESSAGE}")
+
+    def test_a_personal_link_is_a_stand_in_too(self):
+        self.assert_refused(lambda: self.update(IssueChanges(description="See [personal link]")), f"The new description holds [personal link], {STAND_INS_MESSAGE}")
+
+    def test_a_text_in_fields_json_is_judged_like_a_text_of_an_option(self):
+        self.assert_refused(
+            lambda: self.update(IssueChanges(fields={"description": "Ask [~user]"})), f"The new description holds [~user], {STAND_INS_MESSAGE}"
+        )
+        self.assert_refused(lambda: self.update(IssueChanges(fields={"summary": "[email]"}, labels=["x"])), f"The new summary holds [email], {STAND_INS_MESSAGE}")
+
+    def test_several_texts_are_named_together(self):
+        self.assert_refused(
+            lambda: self.update(IssueChanges(summary="About [~user]", description="Write to [email]")),
+            f"The new summary and description hold [~user], [email], {STAND_INS_MESSAGE}",
+        )
+
+    def test_the_acceptance_criteria_in_fields_json_are_judged_by_the_id_that_jira_names(self):
+        error = self.assert_refused(
+            lambda: self.update(IssueChanges(fields={"customfield_10004": "GIVEN [~user]"})),
+            f"The new acceptance criteria holds [~user], {STAND_INS_MESSAGE}",
+        )
+        self.assertEqual(error.details["fields"], ["acceptance"])
+        self.assertEqual(self.gateway.called("get_issue")[0][2], ("summary", "updated", "acceptance"))
+        self.assertEqual(len(self.gateway.called("field_ids")), 1)
+
+    def test_another_custom_field_is_not_judged_and_the_literal_in_the_acceptance_of_jira_may_stay(self):
+        self.update(IssueChanges(fields={"customfield_10099": "Ask [~user]"}))
+        self.assertEqual(len(self.gateway.called("update_issue")), 1)
+        self.gateway.issues["PROJ-1"] = dataclasses.replace(self.gateway.issues["PROJ-1"], acceptance="Mail [email]")
+        self.update(IssueChanges(fields={"customfield_10004": "Mail [email] again"}))
+        self.assertEqual(len(self.gateway.called("update_issue")), 2)
+
+    def test_a_stand_in_that_jira_holds_already_is_a_text_somebody_wrote_and_may_stay(self):
+        self.gateway.issues["PROJ-1"] = dataclasses.replace(self.gateway.issues["PROJ-1"], description="Write to [email] for details")
+        result = self.update(IssueChanges(description="Write to [email] for details, please"))
+        self.assertEqual(result.payload, {"fields": {"description": "Write to [email] for details, please"}})
+        self.assertEqual(self.gateway.called("update_issue")[0][2], result.payload)
+        self.assertEqual(self.gateway.called("get_issue")[0][2], ("summary", "updated", "description"))
+
+    def test_a_stand_in_that_jira_does_not_hold_is_refused_next_to_one_that_it_does(self):
+        self.gateway.issues["PROJ-1"] = dataclasses.replace(self.gateway.issues["PROJ-1"], description="Write to [email] for details")
+        self.assert_refused(
+            lambda: self.update(IssueChanges(description="Write to [email] and ask [~user]")),
+            f"The new description holds [~user], {STAND_INS_MESSAGE}",
+        )
+
+    def test_a_real_mention_and_a_text_without_people_pass_and_a_live_run_asks_for_nothing(self):
+        self.update(IssueChanges(summary="Plain", description="Ask [~jdoe] and mail jane.doe@example.com", labels=["x"]))
+        self.update(IssueChanges(fields={"description": "Plain text"}))
+        self.assertEqual(len(self.gateway.called("update_issue")), 2)
+        self.assertEqual((self.gateway.called("get_issue"), self.gateway.called("field_ids")), ([], []))
+
+    def test_what_a_valid_dry_run_reads_and_says_is_what_it_was(self):
+        result = self.update(IssueChanges(summary="Plain", description="Plain too"), dry_run=True)
+        self.assertEqual((result.dry_run, result.warnings, result.payload), (True, [], {"fields": {"summary": "Plain", "description": "Plain too"}}))
+        self.assertEqual([call[1:] for call in self.gateway.called("get_issue")], [("PROJ-1", ("summary", "updated"))])
+        self.assertEqual(self.gateway.called("update_issue"), [])
+
+    def test_a_guard_and_a_text_with_a_stand_in_that_may_stay_need_one_read_only(self):
+        self.gateway.issues["PROJ-1"] = dataclasses.replace(self.gateway.issues["PROJ-1"], description="Write to [email]")
+        self.update(IssueChanges(description="Write to [email] today"), if_unchanged_since="2026-10-10T07:00:00Z")
+        self.assertEqual([call[1:] for call in self.gateway.called("get_issue")], [("PROJ-1", ("summary", "updated", "description"))])
+
+    def test_the_refusal_comes_before_the_assignee_is_looked_up_and_after_the_issue_is_found(self):
+        self.assert_refused(
+            lambda: self.update(IssueChanges(description=READ_DESCRIPTION, assignee="zed")), f"The new description holds [~user], [email], {STAND_INS_MESSAGE}"
+        )
+        self.assertEqual(self.gateway.called("find_users"), [])
+        with self.assertRaises(NotFoundError):
+            self.app.update_issue.execute("PROJ-999", IssueChanges(description=READ_DESCRIPTION))
+
+    def test_update_json_judges_fields_and_the_set_of_update_the_same_way(self):
+        def send(payload, **options):
+            return self.app.update_issue_from_payload.execute("PROJ-1", payload, **options)
+
+        for payload, what in (
+            ({"fields": {"description": READ_DESCRIPTION}}, "description holds [~user], [email]"),
+            ({"fields": {"summary": "Mail [email]"}}, "summary holds [email]"),
+            ({"update": {"description": [{"set": "See [personal link]"}]}}, "description holds [personal link]"),
+            ({"fields": {"customfield_10004": "[~user]"}}, "acceptance criteria holds [~user]"),
+        ):
+            for options in ({}, {"dry_run": True}):
+                with self.subTest(payload=payload, options=options), self.assertRaises(ValidationError) as caught:
+                    send(payload, **options)
+                self.assertIn(f"The new {what}, {STAND_INS_MESSAGE}", caught.exception.message)
+        self.assertEqual(self.gateway.called("update_issue"), [])
+
+    def test_update_json_with_nothing_to_overwrite_passes_and_reads_nothing(self):
+        for payload in (
+            {"fields": {"summary": "Fine", "description": "Ask [~jdoe]"}},
+            {"update": {"labels": [{"add": "fine"}, {"remove": "[~user]"}], "description": [{"remove": "x"}]}},
+            {"fields": {"customfield_10099": "[~user]", "customfield_10100": ["[email]"]}},  # custom fields other than the acceptance are not judged
+            {"fields": {"versions": [{"name": "[email]"}]}},  # `jira issue` does not show the affected versions
+        ):
+            self.app.update_issue_from_payload.execute("PROJ-1", payload)
+        self.assertEqual(len(self.gateway.called("update_issue")), 4)
+        self.assertEqual(self.gateway.called("get_issue"), [])
+
+    def test_update_json_with_a_literal_that_jira_holds_passes(self):
+        self.gateway.issues["PROJ-1"] = dataclasses.replace(self.gateway.issues["PROJ-1"], summary="Mail [email]")
+        self.app.update_issue_from_payload.execute("PROJ-1", {"fields": {"summary": "Mail [email] now"}})
+        self.assertEqual(len(self.gateway.called("update_issue")), 1)
+
+    # -- the names of labels, components and fix versions ------------------------------------------------------------------------------
+
+    def test_the_hint_names_the_way_out_with_the_real_key_for_every_form(self):
+        error = self.assert_refused(lambda: self.update(IssueChanges(summary="[email] Add retry")), f"The new summary holds [email], {STAND_INS_MESSAGE}")
+        self.assertIn("a text that holds people is best edited in Jira itself. If the stand-in is really what you want to write", error.hint)
+        self.assertTrue(error.hint.endswith("send it with `jira api PUT issue/PROJ-1 --data-file FILE --write` (the raw call has no guard)."))
+        with self.assertRaises(ValidationError) as other:
+            self.app.update_issue.execute("proj-2", IssueChanges(labels=["[email]"]))
+        self.assertIn("`jira api PUT issue/PROJ-2 --data-file FILE --write`", other.exception.hint)  # the key as the command normalises it
+        with self.assertRaises(ValidationError) as raw:
+            self.app.update_issue_from_payload.execute("PROJ-3", {"fields": {"summary": "[email]"}})
+        self.assertIn("`jira api PUT issue/PROJ-3 --data-file FILE --write`", raw.exception.hint)
+
+    def test_labels_components_and_fix_versions_are_judged_item_by_item(self):
+        for changes, called, mark, field_name in (
+            (IssueChanges(labels=["[email]", "backend"]), "labels", "[email]", "labels"),
+            (IssueChanges(components=["[~user]"]), "components", "[~user]", "components"),
+            (IssueChanges(fix_versions=["Release [personal link]"]), "fix versions", "[personal link]", "fixVersions"),
+        ):
+            for options in ({}, {"dry_run": True}):
+                with self.subTest(field=field_name, options=options):
+                    error = self.assert_refused(lambda: self.update(changes, **options), f"The new {called} hold {mark}, {STAND_INS_MESSAGE}")
+                    self.assertEqual(error.details, {"fields": [field_name], "placeholders": [mark]})
+        self.assertEqual(self.gateway.called("get_issue")[0][2], ("summary", "updated", "labels"))
+        self.assertEqual(self.gateway.called("get_issue")[1][2], ("summary", "updated", "labels"))  # the dry run reads the same
+        self.assertEqual(self.gateway.called("get_issue")[2][2], ("summary", "updated", "components"))
+
+    def test_the_names_in_fields_json_are_judged_like_those_of_an_option(self):
+        for fields, called, mark in (
+            ({"labels": ["[email]"]}, "labels", "[email]"),
+            ({"components": [{"name": "[email]"}]}, "components", "[email]"),
+            ({"fixVersions": [{"name": "[~user]"}]}, "fix versions", "[~user]"),
+        ):
+            with self.subTest(fields=fields):
+                self.assert_refused(lambda: self.update(IssueChanges(fields=fields)), f"The new {called} hold {mark}, {STAND_INS_MESSAGE}")
+
+    def test_a_name_that_jira_holds_verbatim_may_stay_and_the_new_one_is_refused(self):
+        self.gateway.issues["PROJ-1"] = dataclasses.replace(self.gateway.issues["PROJ-1"], labels=["[email]", "backend"])
+        self.update(IssueChanges(labels=["[email]", "backend", "new"]))
+        self.assertEqual(self.gateway.called("update_issue")[0][2], {"fields": {"labels": ["[email]", "backend", "new"]}})
+        self.assertEqual(self.gateway.called("get_issue")[0][2], ("summary", "updated", "labels"))
+        with self.assertRaises(ValidationError) as caught:  # the stand-in that Jira holds stays out of the message: only the new one is named
+            self.update(IssueChanges(labels=["[email]", "[~user]"]))
+        self.assertEqual(caught.exception.message, f"The new labels hold [~user], {STAND_INS_MESSAGE}")
+        self.assertEqual(len(self.gateway.called("update_issue")), 1)  # nothing more was sent
+
+    def test_the_list_that_was_read_cannot_be_sent_back_when_jira_holds_the_real_names(self):
+        self.gateway.issues["PROJ-1"] = dataclasses.replace(self.gateway.issues["PROJ-1"], labels=["jane.doe@example.com", "backend"], components=["Demo"])
+        self.assert_refused(lambda: self.update(IssueChanges(labels=["[email]", "backend"])), f"The new labels hold [email], {STAND_INS_MESSAGE}")
+        self.assertEqual(self.gateway.issues["PROJ-1"].labels, ["jane.doe@example.com", "backend"])
+
+    def test_a_text_and_a_list_are_named_together_and_compared_each_with_its_own_current_value(self):
+        self.gateway.issues["PROJ-1"] = dataclasses.replace(self.gateway.issues["PROJ-1"], labels=["[email]"])
+        error = self.assert_refused(
+            lambda: self.update(IssueChanges(summary="About [~user]", labels=["[email]"], components=["[email]"])),
+            f"The new summary and components hold [~user], [email], {STAND_INS_MESSAGE}",
+        )
+        self.assertEqual(error.details, {"fields": ["summary", "components"], "placeholders": ["[~user]", "[email]"]})
+        self.assertEqual(self.gateway.called("get_issue")[0][2], ("summary", "updated", "labels", "components"))
+
+    def test_a_guard_and_a_name_that_may_stay_need_one_read_only(self):
+        self.gateway.issues["PROJ-1"] = dataclasses.replace(self.gateway.issues["PROJ-1"], fix_versions=["[email]"])
+        self.update(IssueChanges(fix_versions=["[email]"]), if_unchanged_since="2026-10-10T07:00:00Z")
+        self.assertEqual([call[1:] for call in self.gateway.called("get_issue")], [("PROJ-1", ("summary", "updated", "fixVersions"))])
+
+    def test_names_without_stand_ins_cost_no_request_in_a_live_run_and_the_same_read_in_a_dry_run(self):
+        self.update(IssueChanges(labels=["a", "b"], components=["Demo"], fix_versions=["Release 1.0"]))
+        self.assertEqual((self.gateway.called("get_issue"), self.gateway.called("field_ids")), ([], []))
+        self.update(IssueChanges(labels=["a"], components=["Demo"]), dry_run=True)
+        self.assertEqual([call[1:] for call in self.gateway.called("get_issue")], [("PROJ-1", ("summary", "updated"))])
+
+    def test_update_json_judges_the_names_in_fields_and_in_the_add_and_the_set_of_update(self):
+        def send(payload, **options):
+            return self.app.update_issue_from_payload.execute("PROJ-1", payload, **options)
+
+        for payload, what in (
+            ({"fields": {"labels": ["[email]"]}}, "labels hold [email]"),
+            ({"update": {"labels": [{"add": "[email]"}]}}, "labels hold [email]"),
+            ({"update": {"labels": [{"set": ["x", "[email]"]}]}}, "labels hold [email]"),
+            ({"update": {"components": [{"add": {"name": "[~user]"}}]}}, "components hold [~user]"),
+            ({"update": {"components": [{"set": [{"name": "Demo"}, {"name": "[~user]"}]}]}}, "components hold [~user]"),
+            ({"fields": {"fixVersions": [{"name": "[email]"}]}}, "fix versions hold [email]"),
+            ({"update": {"fixVersions": [{"add": {"name": "[personal link]"}}]}}, "fix versions hold [personal link]"),
+        ):
+            for options in ({}, {"dry_run": True}):
+                with self.subTest(payload=payload, options=options), self.assertRaises(ValidationError) as caught:
+                    send(payload, **options)
+                self.assertIn(f"The new {what}, {STAND_INS_MESSAGE}", caught.exception.message)
+        self.assertEqual(self.gateway.called("update_issue"), [])
+
+    def test_update_json_with_a_name_that_jira_holds_passes(self):
+        self.gateway.issues["PROJ-1"] = dataclasses.replace(self.gateway.issues["PROJ-1"], labels=["[email]"])
+        self.app.update_issue_from_payload.execute("PROJ-1", {"update": {"labels": [{"add": "[email]"}]}})
+        self.assertEqual(len(self.gateway.called("update_issue")), 1)
+
+    def test_an_update_json_with_names_that_hold_no_stand_in_reads_nothing(self):
+        self.app.update_issue_from_payload.execute("PROJ-1", {"fields": {"labels": ["backend", "api"], "components": [{"name": "Demo"}]}})
+        self.app.update_issue_from_payload.execute("PROJ-1", {"update": {"labels": [{"add": "x"}], "fixVersions": [{"set": [{"name": "Release 1.0"}]}]}})
+        self.assertEqual(self.gateway.called("get_issue"), [])
+
+
+class CreateStandInTest(unittest.TestCase):
+    """A new issue has no old text to overwrite: a stand-in in its dry run is a note, not a refusal."""
+
+    def setUp(self):
+        self.gateway = FakeGateway()
+        self.app = build_app(gateway=self.gateway)
+
+    def draft(self, **changes):
+        return IssueDraft(**{"project": "PROJ", "issue_type": "Story", "summary": "New story", **changes})
+
+    def test_the_dry_run_notes_it_and_still_shows_the_payload(self):
+        result = self.app.create_issue.execute(self.draft(description=READ_DESCRIPTION), dry_run=True)
+        self.assertEqual(result.payload["fields"]["description"], READ_DESCRIPTION)
+        self.assertEqual(
+            result.warnings,
+            [
+                "The description of the new issue holds [~user], [email], which stands in place of a mention or an address that the CLI hides: "
+                "Jira would keep it as plain text, not as the real person or address."
+            ],
+        )
+        self.assertEqual((result.dry_run, self.gateway.called("create_issue")), (True, []))
+
+    def test_the_note_comes_after_the_other_warnings_and_names_every_text(self):
+        self.gateway.required_to_create["10200"] = [FieldRule("customfield_10005", "Epic Name", required=True)]
+        result = self.app.create_issue.execute(self.draft(summary="About [~user]", description="Write to [email]"), dry_run=True)
+        self.assertEqual(len(result.warnings), 2)
+        self.assertIn("Epic Name", result.warnings[0])
+        self.assertIn("The summary and description of the new issue hold [~user], [email]", result.warnings[1])
+
+    def test_the_acceptance_criteria_of_a_payload_count_when_jira_names_their_field(self):
+        result = self.app.create_issue.execute(self.draft(fields={"customfield_10004": "GIVEN [~user]"}), dry_run=True)
+        self.assertIn("The acceptance criteria of the new issue holds [~user]", result.warnings[0])
+
+    def test_a_live_create_sends_the_text_as_it_is_with_no_note(self):
+        result = self.app.create_issue.execute(self.draft(description=READ_DESCRIPTION))
+        self.assertEqual(result.warnings, [])
+        self.assertEqual(self.gateway.called("create_issue")[0][1]["fields"]["description"], READ_DESCRIPTION)
+
+    def test_a_text_without_stand_ins_has_no_note_and_asks_nothing_more(self):
+        result = self.app.create_issue.execute(self.draft(description="Ask [~jdoe]", fields={"customfield_10099": "text"}), dry_run=True)
+        self.assertEqual(result.warnings, [])
+        self.assertEqual(self.gateway.called("field_ids"), [])
+
+    def test_create_json_notes_it_in_the_dry_run_too(self):
+        payload = {"fields": {"project": {"key": "PROJ"}, "issuetype": {"id": "10200"}, "summary": "Mail [email]", "description": "Ask [~user]"}}
+        result = self.app.create_issue_from_payload.execute(payload, dry_run=True)
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("The summary and description of the new issue hold [~user], [email]", result.warnings[0])
+        self.assertEqual(self.app.create_issue_from_payload.execute(payload).warnings, [])
+        self.assertEqual(len(self.gateway.called("create_issue")), 1)
+
+    def test_the_names_of_labels_components_and_fix_versions_get_the_same_note(self):
+        result = self.app.create_issue.execute(self.draft(labels=["[email]", "backend"]), dry_run=True)
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("The labels of the new issue hold [email], which stands in place of a mention or an address", result.warnings[0])
+        payload = {"fields": {"project": {"key": "PROJ"}, "issuetype": {"name": "Story"}, "summary": "S", "components": [{"name": "[~user]"}], "fixVersions": [{"name": "[email]"}]}}
+        noted = self.app.create_issue_from_payload.execute(payload, dry_run=True)  # the type is named, not given by id: nothing else is checked
+        self.assertEqual(len(noted.warnings), 1)
+        self.assertIn("The components and fix versions of the new issue hold [~user], [email]", noted.warnings[0])
+        self.assertEqual(self.app.create_issue.execute(self.draft(labels=["[email]"])).warnings, [])  # a live create sends it and says nothing
 
 
 class CreateTest(unittest.TestCase):
@@ -277,6 +545,28 @@ class ImportMarkdownTest(unittest.TestCase):
         outcome = self.app.import_markdown.execute("t/001-story.md", dry_run=True)
         self.assertTrue(outcome.dry_run and outcome.payload)
         self.assertEqual(self.gateway.called("create_issue"), [])
+
+    def test_an_assignee_by_display_name_is_resolved_like_in_create_and_update(self):
+        self.files.files["t/a.md"] = "---\nsummary: S\nissuetype: Story\nassignee: Alex Smith\n---\nBody\n"
+        self.app.import_markdown.execute("t/a.md")
+        self.assertEqual(self.fields()["assignee"], {"name": "asmith"})
+        self.files.files["t/u.md"] = "---\nissue_key: PROJ-1\nsummary: Renamed\nassignee: Alex Smith\n---\nBody\n"
+        self.app.import_markdown.execute("t/u.md")
+        self.assertEqual(self.gateway.called("update_issue")[0][2]["fields"]["assignee"], {"name": "asmith"})
+
+    def test_an_ambiguous_assignee_creates_nothing(self):
+        self.files.files["t/a.md"] = "---\nsummary: S\nissuetype: Story\nassignee: Sam Sample\n---\nBody\n"
+        with self.assertRaises(ValidationError):
+            self.app.import_markdown.execute("t/a.md")
+        self.assertEqual(self.gateway.called("create_issue"), [])
+
+    def test_the_dry_run_checks_the_priority_and_a_live_import_leaves_that_to_jira(self):
+        self.files.files["t/p.md"] = "---\nsummary: S\nissuetype: Story\npriority: Nope\n---\nBody\n"
+        with self.assertRaises(RejectedError) as caught:
+            self.app.import_markdown.execute("t/p.md", dry_run=True)
+        self.assertIn("Allowed priorities", caught.exception.hint)
+        self.app.import_markdown.execute("t/p.md")
+        self.assertEqual(self.fields()["priority"], {"name": "Nope"})
 
     def test_unknown_fix_version_is_refused_or_skipped(self):
         self.files.files["t/v.md"] = TICKET.replace("Release 1.0", "NOPE")
@@ -456,6 +746,16 @@ class ImportCsvTest(unittest.TestCase):
     def test_byte_order_mark_is_ignored(self):
         self.files.files["bom.csv"] = "\ufeffsummary,issuetype\nA,Story\n"
         self.assertEqual(self.app.import_csv.execute("bom.csv").outcomes[0].action, "created")
+
+    def test_a_row_resolves_its_assignee_and_a_dry_run_checks_its_priority(self):
+        self.files.files["who.csv"] = "summary,issuetype,assignee,priority\nOne,Story,Alex Smith,High\nTwo,Story,Sam Sample,High\nThree,Story,,Nope\n"
+        live = self.app.import_csv.execute("who.csv", continue_on_error=True)
+        self.assertEqual([o.action for o in live.outcomes], ["created", "failed", "created"])  # the priority is left to Jira in a live run
+        self.assertEqual(self.gateway.called("create_issue")[0][1]["fields"]["assignee"], {"name": "asmith"})
+        self.assertIn("matches 2 users", live.outcomes[1].message)
+        dry = self.app.import_csv.execute("who.csv", dry_run=True, continue_on_error=True)
+        self.assertEqual([o.action for o in dry.outcomes], ["created", "failed", "failed"])
+        self.assertIn("priority 'Nope'", dry.outcomes[2].message)
 
     def test_a_row_that_updates_from_a_placeholder_is_refused_and_one_that_creates_is_not(self):
         self.files.files["marks.csv"] = "issue_key,summary,issuetype,description\nPROJ-1,Renamed,Story,Ask [~user]\n,New issue,Story,Ask [~user]\n"

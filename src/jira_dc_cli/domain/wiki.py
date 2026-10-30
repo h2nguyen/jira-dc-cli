@@ -10,6 +10,17 @@ import re
 from .errors import ValidationError
 
 
+def _code_span(match: re.Match[str]) -> str:
+    """`code` as `{{code}}`. Jira does not read `{{` or `}}` with a blank next to them as monospace, so a blank inside the backticks
+    goes outside the braces, a span of blanks is only blanks, and a brace in the code is escaped."""
+    inner = match.group(1)
+    core = inner.strip()
+    if not core:
+        return inner
+    lead, trail = inner[: len(inner) - len(inner.lstrip())], inner[len(inner.rstrip()) :]
+    return lead + "{{" + core.replace("{", "\\{").replace("}", "\\}") + "}}" + trail
+
+
 def _inline(value: str) -> str:
     """Convert inline Markdown without letting one conversion affect another."""
     tokens: list[str] = []
@@ -23,7 +34,7 @@ def _inline(value: str) -> str:
         return re.sub(pattern, lambda match: protect(renderer(match)), source)
 
     # Every pattern below is anchored or bounded: a hostile line of 32,000 characters must not make one of them quadratic or worse.
-    value = sub(r"`([^`\n]+)`", lambda m: "{{" + m.group(1) + "}}", value)
+    value = sub(r"`([^`\n]+)`", _code_span, value)
     # Images and links are protected before emphasis is converted.
     value = sub(
         r"!\[([^\]]{0,500})\]\(([^)\s]{1,1000})(?:\s+[\"'][^\"']*[\"'])?\)",
@@ -112,3 +123,57 @@ def markdown_to_wiki(text: str) -> str:
     if in_fence:  # be forgiving about an unclosed fence
         out.append("{code}")
     return "\n".join(out).rstrip() + "\n"
+
+
+_CHECKS: tuple[tuple["re.Pattern[str]", str], ...] = (
+    (re.compile(r"^\s*\|.*\|\s*$"), "a Markdown table is not converted: Jira reads `| a | b |` as a table row, but its header row is written `|| a || b ||`, and the `---` row becomes a row of dashes"),
+    (re.compile(r"^\s*[-*+]\s+\[[ xX]\]\s"), "a task list item is not converted: Jira shows the brackets as text, there is no check box"),
+    (re.compile(r"^\s*(?:=+|-+)\s*$"), ""),  # a setext underline: decided in the loop, because it needs the line before it
+    (re.compile(r"\[[^\]\n]{1,300}\]\[[^\]\n]{0,100}\]|^\[[^\]\n]{1,300}\]:\s*\S"), "a reference-style link is not converted: write the link in the form [text](address)"),
+    (re.compile(r"\[\^[^\]\n]{1,100}\]"), "a footnote is not converted and shows as text"),
+    (re.compile(r"</?(?:a|b|br|code|details|div|em|font|h[1-6]|hr|i|img|li|ol|p|pre|span|strong|sub|summary|sup|table|td|th|tr|u|ul)\b[^<>\n]*>", re.IGNORECASE), "an HTML tag is not rendered: Jira shows it as text"),
+    (re.compile(r"^\s*>\s*>"), "a nested block quote is not converted: Jira has one level of `bq.`"),
+)
+_BRACE = re.compile(r"(?<!\\)[{}]")
+_FENCE_LINE = re.compile(r"^\s*```([^`]*)$")
+_CODE_SPAN = re.compile(r"`[^`\n]*`")
+_MAX_CHECKED_LINE = 5000  # a longer line is no prose: checking it costs more than it tells, and a hostile one must not make a pattern slow
+
+
+def check_markdown(text: str) -> list[tuple[int, str]]:
+    """What Jira is known not to render the way the Markdown meant it, as (line number, what), for `jira wiki --check`.
+    Code (fences and backtick spans) and front matter (import metadata, which the conversion drops) are left alone; a brace outside
+    code can start a Jira macro (`{code}`, `{color}`)."""
+    normalized = text.replace("\r\n", "\n")
+    front_matter = 0
+    if normalized.startswith("---\n") and normalized.find("\n---\n", 4) >= 0:
+        front_matter = normalized[: normalized.find("\n---\n", 4) + 5].count("\n")
+    problems: list[tuple[int, str]] = []
+    in_fence = False
+    previous = ""
+    for number, line in enumerate(normalized.split("\n"), start=1):
+        if number <= front_matter:
+            continue
+        if _FENCE_LINE.match(line):
+            in_fence = not in_fence
+            previous = ""  # a rule after a fence is no underline of the fence
+            continue
+        if in_fence:
+            continue
+        if len(line) > _MAX_CHECKED_LINE:
+            problems.append((number, f"the line is too long to check ({len(line)} characters)"))
+            previous = ""
+            continue
+        prose = _CODE_SPAN.sub("", line)
+        for pattern, message in _CHECKS:
+            if not pattern.search(prose):
+                continue
+            if message == "":  # a setext underline: only when a line of text stands above it
+                if previous.strip() and not previous.lstrip().startswith(("-", "*", "+", "#", ">", "|")) and len(line.strip()) >= 2:
+                    problems.append((number, "an underlined heading is not converted: write it as `# Title`"))
+            else:
+                problems.append((number, message))
+        if _BRACE.search(prose):
+            problems.append((number, "a brace outside code can start a Jira macro: put the text in a code span, or write `\\{`"))
+        previous = line
+    return problems

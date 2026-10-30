@@ -61,7 +61,10 @@ from the least to the most invasive:
    `-I -X utf8` in front.
 2. **Put the launchers where every Windows shell looks already.** The installer prints this when it applies, for
    example `python install.py --bin-dir "$env:LOCALAPPDATA\Microsoft\WindowsApps"` in PowerShell (the folder of the app
-   execution aliases is on the `PATH` of every user). Git Bash finds the launchers there as well.
+   execution aliases is on the `PATH` of every user). Git Bash finds the launchers there as well. When the launcher of the
+   sibling CLI, `conflu`, already sits in a folder on the `PATH` that you may write to, the installer prints the exact
+   `--bin-dir` command for that folder first: both launchers then live side by side. `jira doctor` has a `launcher` check
+   that says whether `jira` is found by name and, when it is not, prints the same command.
 3. **Add `~/bin` to the user `PATH`** (Windows Settings, search for "environment variables").
 
 Open a new terminal, and restart VS Code, after you change the `PATH`: running programs keep the old one. A

@@ -1,4 +1,5 @@
 """A Markdown ticket of a mirror folder: reading and writing it without disturbing the rest, and deciding which side changed."""
+import itertools
 import json
 import unittest
 
@@ -9,8 +10,10 @@ from jira_dc_cli.domain.mirror import (
     CONFLICT,
     DIFFERS,
     JIRA_CHANGED,
+    LINKS,
     LOCAL_CHANGED,
     MIXED,
+    NO_LINKS,
     SAME,
     MirrorFile,
     Verdict,
@@ -19,6 +22,7 @@ from jira_dc_cli.domain.mirror import (
     carries,
     classify,
     differing,
+    file_links,
     local_managed,
     new_file,
     placeholders_in,
@@ -27,6 +31,8 @@ from jira_dc_cli.domain.mirror import (
     stamp,
     update_payload,
 )
+from jira_dc_cli.domain.mirror_links import parse_line
+from jira_dc_cli.domain.model import IssueLink, IssueRef
 from jira_dc_cli.domain.wiki import markdown_to_wiki
 from tests.support.fakes import sample_issue
 
@@ -163,7 +169,7 @@ class ManagedTest(unittest.TestCase):
     def test_what_is_kept_in_step(self):
         file = mirror()
         local, remote = managed(file, issue_like())
-        self.assertEqual(sorted(local.values), ["acceptance", "components", "description", "fixVersions", "labels", "priority", "storyPoints", "summary"])
+        self.assertEqual(sorted(local.values), ["acceptance", "components", "description", "fixVersions", "labels", "links", "priority", "storyPoints", "summary"])
         self.assertEqual(local.values["storyPoints"], 5.0)
         self.assertEqual(local.raw["labels"], ["reporting", "export"])
         self.assertEqual(differing(local, remote), [])
@@ -571,6 +577,210 @@ class NewFileTest(unittest.TestCase):
     def test_without_story_points_or_acceptance_the_json_is_empty(self):
         file, _ = new_file(issue_like(story_points=None, acceptance=""), IDS, key_line="jira_key", project="PROJ")
         self.assertEqual(file.get("fields_json"), "{}")
+
+
+def held(line):
+    """The links of an issue as Jira gives them back, from the line that lists them."""
+    return [IssueLink(entry.type_name, "phrase", entry.direction, IssueRef(entry.key)) for entry in parse_line(line)]
+
+
+def with_links(line, text=STORY):
+    """The file with a `links:` line after `fix_versions:`; with None the file as it is."""
+    return mirror(text if line is None else text.replace("fix_versions: Release 1.0\n", f"fix_versions: Release 1.0\nlinks: {line}\n"))
+
+
+def links_pair(file_line, jira_line):
+    return managed(with_links(file_line), issue_like(links=held(jira_line)))
+
+
+SETS = ("", "Blocks -> PROJ-2", "Blocks -> PROJ-2, Blocks <- PROJ-3")  # no link, one, two: what the file or Jira may hold
+
+
+class LinksManagedTest(unittest.TestCase):
+    def test_the_line_is_what_the_file_holds_and_the_issue_what_jira_holds(self):
+        local, remote = links_pair("Blocks -> PROJ-2, Relates <- PROJ-3", "relates <- proj-3, BLOCKS -> PROJ-2")
+        self.assertEqual(local.values[LINKS], ["blocks -> PROJ-2", "relates <- PROJ-3"])
+        self.assertEqual((differing(local, remote), local.digests()[LINKS]), ([], remote.digests()[LINKS]))  # order, case and blanks make no difference
+
+    def test_a_file_without_the_line_lists_no_link(self):
+        local, remote = managed(mirror(), issue_like())
+        self.assertEqual((local.values[LINKS], differing(local, remote)), ([], []))
+        self.assertEqual(differing(*managed(mirror(), issue_like(links=held("Blocks -> PROJ-2")))), [LINKS])
+        self.assertEqual(differing(*managed(with_links(""), issue_like())), [])  # an empty line says the same
+
+    def test_a_link_in_one_place_only_is_a_difference_and_so_is_the_other_end_of_it(self):
+        for file_line, jira_line in (("Blocks -> PROJ-2", ""), ("", "Blocks -> PROJ-2"), ("Blocks -> PROJ-2", "Blocks <- PROJ-2"), ("Blocks -> PROJ-2", "Relates -> PROJ-2"), ("Blocks -> PROJ-2", "Blocks -> PROJ-3")):
+            with self.subTest(file=file_line, jira=jira_line):
+                self.assertEqual(differing(*links_pair(file_line, jira_line)), [LINKS])
+
+    def test_the_digest_follows_the_set_of_links_and_nothing_else(self):
+        digests = {line: links_pair(line, line)[0].digests()[LINKS] for line in SETS}
+        self.assertEqual(len(set(digests.values())), 3)
+        self.assertEqual(links_pair("Blocks <- PROJ-3,Blocks->PROJ-2", "")[0].digests()[LINKS], digests[SETS[2]])
+        for digest in digests.values():
+            self.assertRegex(digest, r"^[0-9a-f]{6}$")
+
+    def test_a_line_that_cannot_be_read_is_an_error_for_the_file(self):
+        for line in ("Blocks > PROJ-2", "Blocks -> PROJ-2, Relates", "Blocks -> PROJ-33"):  # the last one links the issue to itself
+            with self.subTest(line=line):
+                file = with_links(line)
+                with self.assertRaises(ValidationError) as caught:
+                    local_managed(file, IDS, skipped_fields(file, IDS))
+                self.assertIn("links line", caught.exception.message)
+                with self.assertRaises(ValidationError):
+                    file_links(file)
+
+    def test_a_link_type_that_the_line_cannot_hold_leaves_the_links_out_on_both_sides(self):
+        issue = issue_like(links=[IssueLink("Data, Quality", "relates to", "outward", IssueRef("PROJ-2"))])
+        skipped = skipped_fields(mirror(), IDS, issue)
+        self.assertEqual(list(skipped), [LINKS])
+        self.assertIn("comma", skipped[LINKS])
+        local, remote = local_managed(mirror(), IDS, skipped), remote_managed(issue, skipped)
+        self.assertNotIn(LINKS, local.values)
+        self.assertNotIn(LINKS, remote.values)
+        self.assertEqual(differing(local, remote), [])
+        self.assertEqual(skipped_fields(mirror(), IDS), {})  # without the issue nothing can be said
+        self.assertEqual(skipped_fields(mirror(), IDS, issue_like(links=held("Blocks -> PROJ-2"))), {})
+
+    def test_a_link_is_no_text_that_could_hold_a_person_or_a_placeholder(self):
+        local = links_pair("Blocks -> PROJ-2", "")[0]
+        self.assertEqual(placeholders_in([LINKS, "labels"], local), [])
+        self.assertEqual(update_payload([LINKS, "summary"], local, IDS), {"fields": {"summary": "Schedule the report"}})
+        self.assertEqual(update_payload([LINKS], local, IDS), {"fields": {}})  # the links are requests of their own, never part of the payload
+
+
+class LinksClassifyTest(unittest.TestCase):
+    """The links are judged like every other field: against what the file and Jira last agreed on."""
+
+    @staticmethod
+    def expected(file_now, jira_now, file_then, jira_then):
+        if file_now == jira_now:
+            return SAME
+        edited, changed = file_now != file_then, jira_now != jira_then
+        if edited and changed:
+            return CONFLICT
+        return LOCAL_CHANGED if edited else JIRA_CHANGED if changed else SAME  # differs, but as it always did: nothing to do
+
+    def test_every_combination_of_what_the_two_hold_now_and_held_when_they_last_agreed(self):
+        for file_now, jira_now, file_then, jira_then in itertools.product(SETS, repeat=4):
+            local, remote = links_pair(file_now, jira_now)
+            base = agreement(*links_pair(file_then, jira_then))
+            verdict = classify(local, remote, base)
+            state = self.expected(file_now, jira_now, file_then, jira_then)
+            with self.subTest(file=file_now, jira=jira_now, file_then=file_then, jira_then=jira_then):
+                self.assertEqual(verdict.state, state)
+                self.assertEqual(verdict.fields, [] if state == SAME else [LINKS])
+                self.assertEqual((verdict.local, verdict.jira, verdict.conflicts, verdict.unknown), ([LINKS] if state == LOCAL_CHANGED else [], [LINKS] if state == JIRA_CHANGED else [], [LINKS] if state == CONFLICT else [], []))
+
+    def test_a_record_from_before_the_links_were_kept_in_step_counts_as_none_on_either_side(self):
+        self.assertEqual(NO_LINKS, agreement(*links_pair("", ""))[LINKS])
+        expected = {("", ""): SAME, ("", SETS[1]): JIRA_CHANGED, (SETS[1], ""): LOCAL_CHANGED, (SETS[1], SETS[1]): SAME, (SETS[1], SETS[2]): CONFLICT, (SETS[2], SETS[1]): CONFLICT, (SETS[2], ""): LOCAL_CHANGED, ("", SETS[2]): JIRA_CHANGED}
+        for (file_now, jira_now), state in expected.items():
+            local, remote = links_pair(file_now, jira_now)
+            old = {name: pair for name, pair in agreement(local, remote).items() if name != LINKS}  # what 1.0.0 recorded
+            for base in (old, None):
+                with self.subTest(file=file_now, jira=jira_now, base="old" if base else "none"):
+                    verdict = classify(local, remote, base)
+                    self.assertEqual((verdict.state, verdict.unknown), (state, []))  # the links are never a field that nobody agreed on
+
+    def test_a_file_that_never_listed_a_link_does_not_become_a_difference_for_the_other_fields(self):
+        local, remote = links_pair("", SETS[1])
+        old = {name: pair for name, pair in agreement(local, remote).items() if name != LINKS}
+        self.assertEqual(classify(local, remote, old), Verdict(JIRA_CHANGED, [LINKS], [], [LINKS], [], []))
+
+    def test_an_edit_of_another_field_and_a_link_that_jira_gained_are_no_conflict(self):
+        base = agreement(*links_pair("", ""))
+        file = with_links("", STORY.replace("summary: Schedule the report", "summary: Mine"))
+        local, remote = managed(file, issue_like(links=held(SETS[1])))
+        verdict = classify(local, remote, base)
+        self.assertEqual((verdict.state, verdict.local, verdict.jira, verdict.fields), (MIXED, ["summary"], [LINKS], ["summary", LINKS]))
+
+    def test_the_other_fields_keep_their_own_state_beside_a_conflict_of_the_links(self):
+        base = agreement(*links_pair("", ""))
+        file = with_links(SETS[1], STORY.replace("summary: Schedule the report", "summary: Mine"))
+        local, remote = managed(file, issue_like(links=held(SETS[2])))
+        verdict = classify(local, remote, base)
+        self.assertEqual((verdict.state, verdict.conflicts, verdict.local), (CONFLICT, [LINKS], ["summary"]))
+
+    def test_a_file_whose_links_were_never_agreed_stays_a_difference_for_a_field_that_was_not_either(self):
+        file = with_links("", STORY.replace("summary: Schedule the report", "summary: Other"))
+        local, remote = managed(file, issue_like(links=held(SETS[1])))
+        verdict = classify(local, remote, None)
+        self.assertEqual((verdict.state, verdict.unknown, verdict.jira), (DIFFERS, ["summary"], [LINKS]))
+
+
+class LinksFileTest(unittest.TestCase):
+    def test_the_line_is_added_after_the_fix_versions_and_the_rest_of_the_file_stays(self):
+        file = mirror()
+        before = file.render().split("\n")
+        self.assertEqual(apply_remote(file, issue_like(links=held("Blocks <- PROJ-3, Blocks -> PROJ-2")), IDS, [LINKS]), ())
+        lines = file.render().split("\n")
+        self.assertEqual(lines[lines.index("fix_versions: Release 1.0") + 1], "links: Blocks -> PROJ-2, Blocks <- PROJ-3")
+        self.assertEqual([line for line in lines if not line.startswith("links:")], before)
+
+    def test_a_line_that_is_there_is_rewritten_in_its_place(self):
+        file = with_links("Relates -> PROJ-9")
+        position = file.head.index("links: Relates -> PROJ-9")
+        apply_remote(file, issue_like(links=held("Blocks -> PROJ-2")), IDS, [LINKS])
+        self.assertEqual(file.head[position], "links: Blocks -> PROJ-2")
+        self.assertEqual(sum(line.startswith("links:") for line in file.head), 1)
+
+    def test_links_that_left_jira_leave_the_line_blank_and_the_line_stays(self):
+        file = with_links("Blocks -> PROJ-2")
+        apply_remote(file, issue_like(), IDS, [LINKS])
+        self.assertEqual((file.has("links"), file.get("links")), (True, ""))
+        self.assertIn("\nlinks:\n", file.render())
+
+    def test_the_line_is_not_touched_when_the_links_are_not_named(self):
+        file = with_links("Relates -> PROJ-9")
+        apply_remote(file, issue_like(links=held("Blocks -> PROJ-2")), IDS, ["summary"])
+        self.assertEqual(file.get("links"), "Relates -> PROJ-9")
+
+    def test_the_line_goes_after_the_first_line_it_knows_or_to_the_end(self):
+        bare = mirror("---\njira_key: PROJ-33\nlabels: a\nsummary: S\n---\nBody\n")
+        apply_remote(bare, issue_like(links=held("Blocks -> PROJ-2")), IDS, [LINKS])
+        self.assertEqual(bare.head, ["jira_key: PROJ-33", "labels: a", "links: Blocks -> PROJ-2", "summary: S"])
+        nothing = mirror("---\njira_key: PROJ-33\n---\nBody\n")
+        apply_remote(nothing, issue_like(links=held("Blocks -> PROJ-2")), IDS, [LINKS])
+        self.assertEqual(nothing.head, ["jira_key: PROJ-33", "links: Blocks -> PROJ-2"])
+
+    def test_a_new_file_lists_the_links_after_the_fix_versions_and_the_importer_reads_the_line(self):
+        file, dropped = new_file(issue_like(epic_key="PROJ-5", links=held("Blocks <- PROJ-3, Blocks -> PROJ-2")), IDS, key_line="jira_key", project="PROJ")
+        self.assertEqual(dropped, ())
+        lines = file.render().split("\n")
+        self.assertEqual(lines[lines.index("fix_versions: Release 1.0") + 1], "links: Blocks -> PROJ-2, Blocks <- PROJ-3")
+        self.assertEqual(parse_markdown_ticket(file.render()).meta["links"], "Blocks -> PROJ-2, Blocks <- PROJ-3")
+        local, remote = local_managed(file, IDS, {}), remote_managed(issue_like(links=held("Blocks -> PROJ-2, Blocks <- PROJ-3")), {})
+        self.assertEqual(differing(local, remote), [])
+
+    def test_a_file_of_an_issue_without_links_has_no_such_line(self):
+        file, _ = new_file(issue_like(), IDS, key_line="jira_key", project="PROJ")
+        self.assertNotIn("links", file.render())
+        self.assertFalse(file.has("links"))
+
+    def test_the_links_of_an_issue_with_a_type_that_the_line_cannot_hold_are_not_written(self):
+        issue = issue_like(links=[IssueLink("Data, Quality", "relates to", "outward", IssueRef("PROJ-2")), *held("Blocks -> PROJ-3")])
+        file, _ = new_file(issue, IDS, key_line="jira_key", project="PROJ")
+        self.assertFalse(file.has("links"))
+
+    def test_the_links_are_recorded_like_the_other_fields_and_after_them(self):
+        file = mirror()
+        local, remote = links_pair("Blocks -> PROJ-2", "Blocks -> PROJ-2")
+        stamp(file, local, remote, NOW)
+        self.assertEqual(file.base[LINKS], (local.digests()[LINKS], remote.digests()[LINKS]))
+        self.assertEqual(list(file.base)[-1], LINKS)  # the records of a file that was synced before keep their places
+
+    def test_links_kept_as_an_edit_take_only_jiras_digest_and_none_is_the_reference_of_a_file_without_a_record(self):
+        local, remote = links_pair("Blocks -> PROJ-2, Blocks <- PROJ-3", "Blocks -> PROJ-2")
+        fresh = mirror()
+        stamp(fresh, local, remote, NOW, [LINKS], keep=[LINKS])
+        self.assertEqual(fresh.base[LINKS], (NO_LINKS[0], remote.digests()[LINKS]))
+        self.assertEqual(classify(local, remote, fresh.base).state, LOCAL_CHANGED)  # what is left to do is still an edit, not a conflict
+        recorded = mirror()
+        stamp(recorded, *links_pair("", ""), NOW)
+        stamp(recorded, local, remote, NOW, [LINKS], keep=[LINKS])
+        self.assertEqual(recorded.base[LINKS], (links_pair("", "")[0].digests()[LINKS], remote.digests()[LINKS]))
+        self.assertEqual(classify(local, remote, recorded.base).state, LOCAL_CHANGED)
 
 
 class PayloadTest(unittest.TestCase):

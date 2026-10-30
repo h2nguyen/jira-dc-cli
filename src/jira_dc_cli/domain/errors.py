@@ -7,6 +7,7 @@ from typing import Any
 class JiraCliError(Exception):
     exit_code = 1
     code = "ERROR"
+    report_as_json: bool | None = None  # set by the command line when it knows whether the settings (JIRA_OUTPUT, the agent profile) ask for JSON; None: not known
 
     def __init__(self, message: str, *, hint: str = "", details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
@@ -57,8 +58,8 @@ class UnavailableError(JiraCliError):
 EXIT_CODES: tuple[tuple[int, str, str], ...] = (
     (0, "OK", "The command succeeded (also for a dry run)."),
     (1, "ERROR, CONFIG, INVALID", "The command failed: bad input, missing configuration or another error."),
-    (2, "USAGE", "The command line is wrong: unknown command or option, missing argument."),
-    (3, "CONFLICT", "The issue changed in Jira after the time given to --if-unchanged-since, or `pull` and `push` found the same field changed in the file and in Jira."),
+    (2, "USAGE", "The command line is wrong: unknown command or option, missing argument, or a value that the command refuses before it does anything (for example a file that holds the token)."),
+    (3, "CONFLICT", "The issue changed in Jira after the time given to --if-unchanged-since, the sprint is not in the state given to --if-state, or `pull` and `push` found the same field changed in the file and in Jira."),
     (4, "NOT_FOUND", "Jira has no such issue, project or resource (HTTP 404)."),
     (5, "AUTH", "Jira refused the token or the permission (HTTP 401 or 403)."),
     (6, "REJECTED", "Jira understood the request and refused it (for example HTTP 400); its message is shown."),

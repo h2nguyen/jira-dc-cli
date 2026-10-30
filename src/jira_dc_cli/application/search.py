@@ -6,13 +6,15 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Sequence
 
 from ..domain import jql as jql_builder
-from ..domain.errors import JiraCliError, UsageError
+from ..domain.errors import JiraCliError, RejectedError, UsageError
 from ..domain.fields import ACCEPTANCE, EPIC_LINK, SPRINT, STORY_POINTS
 from ..domain.model import Issue, parse_issue_key, parse_project_key
 from ..domain.privacy import hide_users, redact_text
-from ..domain.searchterms import Term, parse_terms, terms_from_jql
+from ..domain.savedfilters import parse_filter_id
+from ..domain.searchterms import Term, parse_terms, terms_from_jql, with_phrases
 from ..domain.snippets import find_passages, lead, matched_terms
 from ..domain.unwiki import wiki_to_text
+from .issues import filter_refused
 from .ports import JiraGateway
 from .settings import Settings
 
@@ -90,6 +92,8 @@ class FindIssues:
         fetch_everything: bool = False,
         match: str = "auto",
         snippets: int = 0,
+        phrases: Sequence[str] = (),
+        filter_id: str = "",
     ) -> FindResult:
         if match not in MATCH_MODES:
             raise UsageError(f"Unknown match mode: {match}", hint=f"Use one of: {', '.join(MATCH_MODES)}.")
@@ -99,6 +103,8 @@ class FindIssues:
             raise UsageError("--limit must be at least 1 and --start-at must not be negative.")
         chosen = self._project(project, all_projects)
         scope = f"project {chosen}" if chosen else "every project"
+        filter_id = parse_filter_id(filter_id) if filter_id else ""
+        text = with_phrases(text, phrases)
         parsed = parse_terms(text)
         options: dict[str, Any] = dict(
             project=chosen,
@@ -111,20 +117,30 @@ class FindIssues:
             fix_version=fix_version.strip(),
             since=since.strip(),
             extra=extra_jql.strip(),
+            filter_id=filter_id,
         )
         fields = [*SEARCH_FIELDS, *(SNIPPET_FIELDS if snippets else ())]
         mode = "any" if match == "any" else "all"
         query = jql_builder.search_query(terms=parsed, match=mode, **options)
         may_relax = match == "auto" and len(parsed.used) > 1
         # When the search may be loosened, the few issues that hold every word are fetched too: they are marked in the loosened list.
-        found = self._find(query, fields, limit=max(limit, RELAX_BELOW) if may_relax else limit, start_at=start_at, everything=fetch_everything)
+        found = self._find(
+            query,
+            fields,
+            limit=max(limit, RELAX_BELOW) if may_relax else limit,
+            start_at=start_at,
+            everything=fetch_everything,
+            filter_id=filter_id,
+        )
         relaxed = False
         strict: list[Issue] = []
         if may_relax and found.total < RELAX_BELOW:
             mode, relaxed = "any", True
-            strict = found.issues if start_at == 0 else self._find(query, fields, limit=RELAX_BELOW, start_at=0, everything=False).issues
+            strict = found.issues
+            if start_at != 0:
+                strict = self._find(query, fields, limit=RELAX_BELOW, start_at=0, everything=False, filter_id=filter_id).issues
             query = jql_builder.search_query(terms=parsed, match="any", **options)
-            found = self._find(query, fields, limit=limit, start_at=start_at, everything=fetch_everything)
+            found = self._find(query, fields, limit=limit, start_at=start_at, everything=fetch_everything, filter_id=filter_id)
         elif not fetch_everything:
             found = _Found(found.issues[:limit], found.total, found.truncated)
         strict_keys = {issue.key for issue in strict}
@@ -132,6 +148,8 @@ class FindIssues:
         notes: list[str] = []
         if text.strip() and not parsed:
             notes.append("The text held no word to search for (only punctuation), so only the filters apply.")
+        if filter_id and chosen:
+            notes.append(f"Filter {filter_id} is searched inside project {chosen} only; add --all-projects to search all of it.")
         if relaxed:
             holding = f"Only {len(strict_keys)} issue{'s' if len(strict_keys) != 1 else ''} hold{'' if len(strict_keys) != 1 else 's'} all"
             notes.append(
@@ -177,13 +195,18 @@ class FindIssues:
         number = identifier.removeprefix("customfield_")
         return f"cf[{number}]" if number.isdigit() else '"Epic Link"'
 
-    def _find(self, query: str, fields: Sequence[str], *, limit: int, start_at: int, everything: bool) -> _Found:
+    def _find(self, query: str, fields: Sequence[str], *, limit: int, start_at: int, everything: bool, filter_id: str = "") -> _Found:
         """The hits from `start_at` on, as many as `limit` (a server may answer with fewer per request: the next page is asked for)."""
         issues: list[Issue] = []
         total, position, truncated = 0, start_at if not everything else 0, False
         wanted = MAX_HITS if everything else limit
         while True:
-            page = self._gateway.search(query, fields=fields, start_at=position, max_results=min(PAGE_SIZE, max(wanted - len(issues), 1)))
+            try:
+                page = self._gateway.search(query, fields=fields, start_at=position, max_results=min(PAGE_SIZE, max(wanted - len(issues), 1)))
+            except RejectedError as error:
+                if filter_id:
+                    raise filter_refused(error, filter_id) from error
+                raise
             total = page.total
             issues.extend(page.issues)
             position += len(page.issues)
