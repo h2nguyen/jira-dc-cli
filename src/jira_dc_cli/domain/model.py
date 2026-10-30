@@ -74,6 +74,22 @@ class Comment:
     created: str
     body: str
     author: User | None = None
+    updated: str = ""
+    by_me: bool | None = None  # whether the token's user wrote it; None when it was not asked or is not known
+    author_ref: str = ""  # a stable pseudonym of the author for when people are hidden (see `jira comment --list`)
+    visibility: str = ""  # "role:Developers" or "group:staff" when the comment is restricted
+    rendered_body: str = ""  # the text as Jira renders it, reduced to plain text; only with `--rendered`
+
+
+@dataclass(frozen=True)
+class Attachment:
+    id: str
+    filename: str
+    mime_type: str = ""
+    size: int = 0
+    created: str = ""
+    author: User | None = None
+    content_url: str = field(default="", repr=False, metadata={"json": False})  # where the bytes are; never printed
 
 
 @dataclass
@@ -100,6 +116,8 @@ class Issue:
     subtasks: list[IssueRef] = field(default_factory=list)
     comments: list[Comment] = field(default_factory=list)
     comment_total: int = 0
+    attachments: list[Attachment] = field(default_factory=list)
+    attachment_total: int = 0
     extra: dict[str, Any] = field(default_factory=dict)
     raw: dict[str, Any] | None = field(default=None, repr=False, compare=False, metadata={"json": False})
 

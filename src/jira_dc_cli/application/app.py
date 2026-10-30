@@ -8,19 +8,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Mapping
 
-from .comments import AddComment, ListComments
+from . import agile as agile_cases
+from . import attachments as attachment_cases
+from . import collab as collab_cases
+from . import comments as comment_cases
+from . import reading as reading_cases
+from . import reference as reference_cases
+from . import users as user_cases
+from . import validation as validation_cases
+from .comments import AddComment
 from .doctor import Doctor
 from .extras import ConvertMarkdown, InstallSkill, RawApi, ReadDocs
 from .imports import ImportCsv, ImportMarkdown, ImportMarkdownDirectory
 from .issues import BuildReport, ExportBacklog, ListFields, SearchIssues, SuggestBranch, ViewIssue
 from .linking import LinkIssues, ListLinkTypes
-from .ports import Clock, ConfigStore, Diagnostics, Docs, Files, JiraGateway
+from .ports import Cache, Clock, ConfigStore, Diagnostics, Docs, Files, JiraGateway
 from .projects import ListAdminProjects, ListProjects, ShowCreateMetadata, ShowProject
 from .search import FindIssues
 from .session import ConfigService, Ping
 from .settings import Settings
 from .sync import DiffMirror, PullMirror, PushMirror, SyncEngine
-from .workflow import TransitionIssue
 from .writing import CreateIssue, CreateIssueFromPayload, UpdateIssue, UpdateIssueFromPayload
 
 
@@ -37,9 +44,7 @@ class Application:
     build_report: BuildReport
     export_backlog: ExportBacklog
     list_fields: ListFields
-    transition_issue: TransitionIssue
     add_comment: AddComment
-    list_comments: ListComments
     link_issues: LinkIssues
     list_link_types: ListLinkTypes
     update_issue: UpdateIssue
@@ -63,6 +68,14 @@ class Application:
     install_skill: InstallSkill
     convert_markdown: ConvertMarkdown
     raw_api: RawApi
+    attachments: attachment_cases.AttachmentsUseCases
+    agile: agile_cases.AgileUseCases
+    comments: comment_cases.CommentsUseCases
+    users: user_cases.UsersUseCases
+    validation: validation_cases.ValidationUseCases
+    reading: reading_cases.ReadingUseCases
+    reference: reference_cases.ReferenceUseCases
+    collab: collab_cases.CollabUseCases
     closers: tuple[Callable[[], None], ...] = ()
 
     def close(self) -> None:
@@ -84,6 +97,7 @@ class Application:
         environ: Mapping[str, str],
         runtime: Mapping[str, str],
         closers: tuple[Callable[[], None], ...] = (),
+        cache: Cache | None = None,
     ) -> "Application":
         create_issue = CreateIssue(gateway, settings)
         update_issue = UpdateIssue(gateway)
@@ -102,9 +116,7 @@ class Application:
             build_report=BuildReport(gateway, settings, diagnostics),
             export_backlog=ExportBacklog(gateway, settings, clock),
             list_fields=ListFields(gateway),
-            transition_issue=TransitionIssue(gateway),
             add_comment=AddComment(gateway),
-            list_comments=ListComments(gateway, settings),
             link_issues=LinkIssues(gateway),
             list_link_types=ListLinkTypes(gateway),
             update_issue=update_issue,
@@ -114,7 +126,7 @@ class Application:
             list_projects=ListProjects(gateway, settings),
             list_admin_projects=ListAdminProjects(gateway, settings, diagnostics),
             show_project=ShowProject(gateway, settings),
-            show_create_metadata=ShowCreateMetadata(gateway),
+            show_create_metadata=ShowCreateMetadata(gateway, settings),
             import_markdown=import_markdown,
             import_markdown_directory=ImportMarkdownDirectory(files, gateway, settings, import_markdown, diagnostics),
             import_csv=ImportCsv(files, settings, create_issue, update_issue),
@@ -123,10 +135,18 @@ class Application:
             push_mirror=PushMirror(engine, gateway, files, update_from_payload),
             config=ConfigService(store, settings, environ, gateway),
             ping=Ping(gateway, settings),
-            doctor=Doctor(gateway, settings, files, store.path, runtime),
+            doctor=Doctor(gateway, settings, files, store.path, runtime, cache, clock),
             read_docs=ReadDocs(docs),
             install_skill=InstallSkill(docs, files),
             convert_markdown=ConvertMarkdown(),
             raw_api=RawApi(gateway, settings),
+            attachments=attachment_cases.build(gateway, settings, files, clock, diagnostics),
+            agile=agile_cases.build(gateway, settings, files, clock, diagnostics),
+            comments=comment_cases.build(gateway, settings, files, clock, diagnostics),
+            users=user_cases.build(gateway, settings, files, clock, diagnostics),
+            validation=validation_cases.build(gateway, settings, files, clock, diagnostics),
+            reading=reading_cases.build(gateway, settings, files, clock, diagnostics),
+            reference=reference_cases.build(gateway, settings, files, clock, diagnostics),
+            collab=collab_cases.build(gateway, settings, files, clock, diagnostics),
             closers=closers,
         )

@@ -7,7 +7,7 @@ from typing import Any
 
 from ..domain.errors import UsageError, ValidationError
 from ..domain.privacy import strip_users
-from ..domain.wiki import markdown_to_wiki
+from ..domain.wiki import check_markdown, markdown_to_wiki
 from .ports import DocTopic, Docs, Files, JiraGateway
 from .settings import Settings
 
@@ -68,6 +68,10 @@ class InstallSkill:
 class ConvertMarkdown:
     def execute(self, text: str) -> str:
         return markdown_to_wiki(text).rstrip()
+
+    def check(self, text: str) -> list[tuple[int, str]]:
+        """What Jira is known not to render as the Markdown meant it: (line number, what)."""
+        return check_markdown(text)
 
 
 @dataclass(frozen=True)

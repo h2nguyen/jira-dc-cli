@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Sequence
+
+from .errors import UsageError
 
 MAX_TERMS = 12
 
@@ -33,6 +36,7 @@ STOP_WORDS = frozenset(
 OPERATORS = frozenset({"and", "or", "not", "und", "oder", "nicht"})
 
 _QUOTES = str.maketrans({"\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"', "\u00ab": '"', "\u00bb": '"'})
+_QUOTE_MARKS = re.compile('["\u201c\u201d\u201e\u201f\u00ab\u00bb]')
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _TOKEN = re.compile(r'"([^"]*)"|(\S+)')
 _EDGE = ".,;:!?()[]{}<>'\u2018\u2019\u201a"
@@ -111,6 +115,19 @@ def parse_terms(text: str) -> Terms:
         else:
             used.append(Term(value, phrase))
     return Terms(tuple(used), tuple(ignored))
+
+
+def with_phrases(text: str, phrases: Sequence[str]) -> str:
+    """The search text with exact phrases added. A phrase is given on its own (`--phrase 'audit trail'`), so that its words stay together
+    without double quotes, which Windows PowerShell 5.1 removes inside an argument. The phrases come first: an unbalanced quote in the
+    text then cannot swallow them, and they are the last terms to be left out at the limit."""
+    quoted: list[str] = []
+    for phrase in phrases:
+        words = " ".join(_QUOTE_MARKS.sub(" ", str(phrase or "")).split())
+        if not words:
+            raise UsageError("--phrase needs the words of the phrase.", hint="For example --phrase 'audit trail'.")
+        quoted.append(f'"{words}"')
+    return " ".join(part for part in (*quoted, str(text or "").strip()) if part)
 
 
 def terms_from_jql(jql: str) -> tuple[Term, ...]:

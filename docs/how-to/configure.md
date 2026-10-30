@@ -14,7 +14,8 @@ jira doctor
 Create a personal access token in your Jira profile (Profile, Personal Access Tokens) and run
 `jira setup-pat`. The input is not shown. The token goes into the configuration file with restricted
 permissions and is never printed, logged or accepted as a command line argument, so it does not end up in
-the shell history.
+the shell history. A token is one line of printable ASCII characters without blanks: `jira setup-pat` and the setting `JIRA_PAT` refuse anything else,
+and the error does not repeat the text.
 
 - **Scripts and agents:** `printf '%s' "$TOKEN" | jira setup-pat --stdin`.
 - **Git Bash without a real terminal:** `jira setup-pat` warns that the input may be visible when it cannot hide
@@ -25,11 +26,11 @@ the shell history.
 
 Settings come from, in this order: **environment variables**, the **configuration file**, the **defaults**.
 A variable that is set but empty counts as not set (so `export JIRA_HIDE_USERS=` cannot switch off a policy of the
-file). `jira config show` lists every setting with its value and its source; secrets are masked. `jira config path`
+file). `jira config show` lists every setting with its value and its source; secrets are masked, and so are the user name and password of an address. `jira config path`
 prints the file. Because the environment wins, `jira config set`, `jira use` and the other commands that change the
 file warn when the variable they change is also set in your environment.
 
-The file is `~/.config/jira-dc-cli/config`. It holds `KEY=value` lines; quote a value that contains spaces
+The file is `~/.config/jira-dc-cli/config`. It holds `KEY=value` lines (UTF-8, or UTF-16 and Windows-1252 as an editor such as Notepad saves it: all are read); quote a value that contains spaces
 (`JIRA_CA_BUNDLE='C:/certs/my ca.pem'`). It is read as data and never executed: a value that needs a shell
 (`$(...)`, backticks, `$VAR`, a leading `~`) is refused with a message instead of being guessed. Inside single
 quotes a `$` or `~` is plain text.
@@ -53,10 +54,11 @@ All settings are in the [configuration reference](../reference/configuration.md)
 
 | Setting | Use |
 | --- | --- |
-| `JIRA_BASE_URL` | Address of Jira, including the context path (`https://host/jira`). Required. Must be https; see below. Without a user name or password: the address is shown as written, and the token is the only credential. |
+| `JIRA_BASE_URL` | Address of Jira, including the context path (`https://host/jira`). Required. Must be https; see below. Put no user name or password in it: they sign in nothing, the CLI leaves them out of every address it prints (`jira config show` shows `********` in place of them, and `jira config set` refuses to save them) and `jira doctor` warns about them. The token is the only credential. |
 | `JIRA_PAT` | The token. Set it with `jira setup-pat`. Required. |
 | `JIRA_PROJECT` | The current project. Set it with `jira use KEY`, forget it with `jira clear-project`. |
-| `JIRA_HIDE_USERS` | `true` forbids printing people. See below. |
+| `JIRA_HIDE_USERS` | `true` removes people from what the commands print. See below. |
+| `JIRA_PROFILE` | `agent` for an AI agent: `JIRA_HIDE_USERS=true` and `JIRA_OUTPUT=json` become the defaults and informational messages stay off standard error. See below. |
 | `JIRA_CA_BUNDLE` | A PEM file for a private company certificate authority. |
 | `JIRA_ALLOW_HTTP` | `true` accepts a plain `http://` address. See below. |
 | `JIRA_OUTPUT` | `json` makes every command that supports it print JSON. For scripts and agents. |
@@ -65,7 +67,8 @@ All settings are in the [configuration reference](../reference/configuration.md)
 ## https only
 
 The token travels in every request, so the CLI refuses a plain `http://` address: anybody on the network path could read
-the token. Addresses on this computer (`localhost`, `127.0.0.1`) are always accepted, for tests. If Jira really only
+the token. Addresses on this computer (`localhost` and loopback addresses such as `127.0.0.1` and `::1`) are always accepted, for tests; a name that only
+starts with `127.` is a name that the network resolves, and is not one of them. If Jira really only
 offers http, on a network you trust, accept the risk explicitly: `jira config set JIRA_ALLOW_HTTP true`.
 `jira doctor` reports the state.
 
@@ -85,7 +88,8 @@ jira config set JIRA_CA_BUNDLE "C:/certs/company-ca.pem"
 
 Some commands show people because that is what they list: the assignee column of `issues`, the lead in `projects`
 and `project`, and who you are in `ping`. Everywhere else people are hidden unless you ask (`issue --with-users`,
-`comment --list --with-users`), and mentions, e-mail addresses and personal share links are removed from text. You
+`comment --list --with-users`), and mentions, e-mail addresses and personal share links are removed from text; Jira's own explanation of a refusal (the error
+message and its details) is cleaned the same way, whatever the setting. You
 can switch the listing columns off (`issues --no-assignee`, `ping --quiet`). To make "no people" a rule instead of a
 habit:
 
@@ -93,10 +97,26 @@ habit:
 jira config set JIRA_HIDE_USERS true
 ```
 
-Now no command prints people, `--with-users` is refused, and the assignee column, reporter, project lead and the
-identity in `ping` disappear. Jira's own error messages are shown with mentions and e-mail addresses removed (a plain
-user name inside Jira's sentence cannot be recognised). An environment variable `JIRA_HIDE_USERS=true` in the shell of
+Now `--with-users` is refused, and the assignee column, reporter, project lead and the identity in `ping` disappear, as do the people in lists, histories and
+saved filters. The people in the details of Jira's error messages are replaced too (a plain user name inside Jira's sentence cannot be recognised). One
+exception stays: your own login appears where a command sets you as the reporter or the assignee (`create`, `assign KEY me`, `update --assignee me`, in
+the dry run and in the result); `ping` and `watch` hide it. An environment variable `JIRA_HIDE_USERS=true` in the shell of
 an agent does the same for one session.
+
+### One setting for an agent: the profile
+
+An agent needs "no people", JSON and few messages. `JIRA_PROFILE=agent` (in the environment of the agent, or once with
+`jira config set JIRA_PROFILE agent`) sets all of it:
+
+| Setting | With the profile |
+| --- | --- |
+| `JIRA_HIDE_USERS` | `true`, unless the setting itself is set (even to `false`): what you set wins. |
+| `JIRA_OUTPUT` | `json`, unless the setting itself is set. Errors then come as JSON on standard error too. |
+| informational messages | Not printed on standard error ("Showing 50 of 120", notes of a search); warnings and errors stay. The JSON holds the same facts. |
+
+`jira config show` lists the profile and, as `profile agent`, the settings it implies. `jira doctor` shows the privacy check as `warn` when
+the profile is on and people can still be shown (because `JIRA_HIDE_USERS` was set to `false`), and `jira doctor --strict-privacy` fails
+whenever people can be shown, profile or not.
 
 ## Custom fields
 
@@ -111,7 +131,8 @@ jira config set JIRA_STORY_POINTS_FIELD customfield_10001
 
 ## Timeouts and retries
 
-`JIRA_CONNECT_TIMEOUT` (default 10 seconds) and `JIRA_MAX_TIME` (120 seconds) bound a request.
+`JIRA_CONNECT_TIMEOUT` (default 10 seconds) and `JIRA_MAX_TIME` (120 seconds) bound a request; each is at most 86,400 seconds (a day), as is
+`jira projects-admin --timeout`. A larger value is refused with a message.
 `JIRA_RETRY` (default 2) retries a **read** after a network error or HTTP 429, 502, 503 or 504. Writes are
 never retried, because a repeated write could create a duplicate.
 

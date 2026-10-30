@@ -130,6 +130,25 @@ class PrivacyTest(unittest.TestCase):
         self.assertEqual(stripped["fields"]["text"], "[~user]")
         self.assertEqual(stripped["fields"]["n"], [1, {"hidden": True}])
 
+    def test_strip_users_also_cleans_the_changelog_of_user_fields_and_the_jql_of_a_filter(self):
+        history = {"items": [
+            {"field": "assignee", "fieldtype": "jira", "from": "jdoe", "fromString": "Jane Doe", "to": "asmith", "toString": "Alex Smith"},
+            {"field": "status", "fieldtype": "jira", "from": "1", "fromString": "To Do", "to": "3", "toString": "Done"},
+        ]}
+        items = strip_users(history)["items"]
+        self.assertEqual([items[0][key] for key in ("from", "fromString", "to", "toString")], [None] * 4)
+        self.assertEqual((items[1]["fromString"], items[1]["toString"]), ("To Do", "Done"))
+        saved = {"id": "10000", "name": "Mine", "jql": 'assignee = jdoe AND reporter in ("asmith") AND status = Open', "searchUrl": "https://jira.example.com/rest/api/2/search?jql=assignee%20%3D%20jdoe"}
+        cleaned = strip_users(saved)
+        self.assertEqual(cleaned["jql"], "assignee = [user] AND reporter in ([user]) AND status = Open")
+        self.assertEqual(cleaned["searchUrl"], "")
+        plain = {"jql": "project = PROJ ORDER BY key", "searchUrl": "https://jira.example.com/rest/api/2/search?jql=project%20%3D%20PROJ"}
+        self.assertEqual(strip_users(plain), plain)
+        by_text = {"jql": 'text ~ "john.doe@example.com" OR summary ~ "[~jdoe]"', "searchUrl": "https://jira.example.com/rest/api/2/search?jql=text%20~%20%22john.doe%40example.com%22"}
+        cleaned = strip_users(by_text)
+        self.assertEqual(cleaned["jql"], 'text ~ "[email]" OR summary ~ "[~user]"')
+        self.assertEqual(cleaned["searchUrl"], "")  # the encoded copy would still hold the address
+
     def test_hide_users_removes_people_from_an_issue(self):
         hidden = hide_users(sample_issue("PROJ-1"))
         self.assertIsNone(hidden.assignee)
@@ -276,6 +295,17 @@ class BacklogTest(unittest.TestCase):
         self.assertEqual(entry["type"], "Story")
         self.assertEqual(entry["status"], "To Do")
 
+    def test_a_key_whose_number_has_thousands_of_digits_is_sorted_last_and_never_an_error(self):
+        huge = "PROJ-" + "9" * 5000  # `int()` refuses more than 4300 digits
+        issues = [sample_issue(huge), sample_issue("PROJ-10"), sample_issue("PROJ-2")]
+        dump = build_backlog_dump(issues, self.IDS, "t")
+        self.assertEqual(list(dump["issues"]), ["PROJ-2", "PROJ-10", huge])  # the number is no number of Jira: the key sorts after the others
+        self.assertEqual(list(build_backlog_dump(issues[::-1], self.IDS, "t")["issues"]), ["PROJ-2", "PROJ-10", huge])
+        longest = "PROJ-" + "9" * 18
+        self.assertEqual(list(build_backlog_dump([sample_issue(longest), sample_issue("PROJ-3")], self.IDS, "t")["issues"]), ["PROJ-3", longest])
+        odd = build_backlog_dump([sample_issue("PROJ-7"), sample_issue("odd")], self.IDS, "t")  # a key without a number is no error either
+        self.assertEqual(sorted(odd["issues"]), ["PROJ-7", "odd"])
+
     def test_dump_has_no_personal_data(self):
         text = str(build_backlog_dump([sample_issue("PROJ-1")], self.IDS, "t"))
         self.assertNotIn("jane.doe", text)
@@ -327,6 +357,14 @@ class DraftsTest(unittest.TestCase):
         self.assertEqual(fields["priority"], {"name": "High"})
         self.assertEqual(fields["assignee"], {"name": "jdoe"})
         self.assertEqual(IssueChanges(labels=[]).to_payload(), {"fields": {"labels": []}})
+
+    def test_a_resolved_assignee_replaces_the_text_that_was_typed(self):
+        self.assertEqual(IssueChanges(assignee="Jane Doe").to_payload({"name": "jdoe"}), {"fields": {"assignee": {"name": "jdoe"}}})
+        self.assertEqual(IssueChanges(assignee="unassigned").to_payload({"name": None}), {"fields": {"assignee": {"name": None}}})
+        self.assertEqual(IssueChanges(summary="S").to_payload({"name": "jdoe"}), {"fields": {"summary": "S"}})  # no assignee asked for: none is sent
+        created = IssueDraft("PROJ", "Story", "S", assignee="Jane Doe").to_payload("10200", "jdoe", {"name": "jdoe2"})
+        self.assertEqual(created["fields"]["assignee"], {"name": "jdoe2"})
+        self.assertNotIn("assignee", IssueDraft("PROJ", "Story", "S").to_payload("10200", "jdoe", {"name": "jdoe2"})["fields"])
 
     def test_a_field_set_twice_is_refused_instead_of_guessed(self):
         with self.assertRaises(ValidationError) as caught:
@@ -486,9 +524,18 @@ class PayloadsTest(unittest.TestCase):
         self.assertEqual(transition_payload("21"), {"transition": {"id": "21"}})
         self.assertEqual(transition_payload("21", " Done. ")["update"], {"comment": [{"add": {"body": "Done."}}]})
 
+    def test_a_transition_can_carry_the_fields_of_its_screen(self):
+        self.assertEqual(transition_payload("21", fields={"resolution": {"name": "Fixed"}}), {"transition": {"id": "21"}, "fields": {"resolution": {"name": "Fixed"}}})
+        self.assertEqual(list(transition_payload("21", "Done.", {"a": 1})), ["transition", "fields", "update"])
+        self.assertEqual(transition_payload("21", fields={}), {"transition": {"id": "21"}})  # no fields, no key
+
     def test_comment_and_link(self):
         self.assertEqual(comment_payload(" hi \n"), {"body": "hi"})
         self.assertEqual(link_payload("Blocks", "A-1", "A-2"), {"type": {"name": "Blocks"}, "outwardIssue": {"key": "A-1"}, "inwardIssue": {"key": "A-2"}})
+
+    def test_a_comment_can_carry_a_restriction(self):
+        self.assertEqual(comment_payload(" hi ", {"type": "role", "value": "Developers"}), {"body": "hi", "visibility": {"type": "role", "value": "Developers"}})
+        self.assertEqual(comment_payload("hi", None), {"body": "hi"})
 
 
 class ErrorsTest(unittest.TestCase):

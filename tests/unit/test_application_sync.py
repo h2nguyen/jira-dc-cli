@@ -3,8 +3,10 @@ import dataclasses
 import re
 import unittest
 
-from jira_dc_cli.domain.errors import ConflictError, NotFoundError, UnavailableError, UsageError, ValidationError
+from jira_dc_cli.domain.errors import AuthError, ConflictError, NotFoundError, RejectedError, UnavailableError, UsageError, ValidationError
 from jira_dc_cli.domain.mirror import MirrorFile
+from jira_dc_cli.domain.model import IssueLink, IssueRef, LinkType
+from jira_dc_cli.domain.payloads import link_payload
 from tests.support.fakes import FakeGateway, MemoryFiles, build_app, sample_issue
 
 DIR = "mirror"
@@ -609,8 +611,8 @@ class PushTest(Fixture):
         self.assertTrue(all("assignee" not in (fields or ()) and "reporter" not in (fields or ()) for fields in asked))
 
 
-class ReviewedCasesTest(Fixture):
-    """Scenarios that an independent review found: each case damaged a file or an issue until it was fixed."""
+class RegressionCasesTest(Fixture):
+    """Scenarios that each damaged a file or an issue until they were fixed."""
 
     def setUp(self):
         super().setUp()
@@ -940,6 +942,702 @@ class ReviewedCasesTest(Fixture):
         self.assertIsInstance(result.first_error, ValidationError)
         self.assertIn("NUL", result.first_error.message)
         self.assertEqual(self.updates(), [])
+
+
+class LinksFixture(Fixture):
+    """The issue links are one more field of the sync: the `links:` line, kept in step like the others, created in Jira by a push, never removed."""
+
+    def setUp(self):
+        super().setUp()
+        self.gateway.link_types.append(LinkType("4", "Relates", "relates to", "relates to"))  # a type that reads the same from both ends
+
+    def pending(self):
+        """What is not in step: key -> state."""
+        return {key: state for key, state in self.states().items() if state != "same"}
+
+    def link(self, type_name, outward, inward):
+        """Somebody links two issues in the web interface of Jira."""
+        self.gateway.create_link(link_payload(type_name, outward, inward))
+        self.gateway.calls.pop()
+
+    def unlink(self, outward, inward):
+        """Somebody removes a link there."""
+        for key, other in ((outward, inward), (inward, outward)):
+            self.put(key, links=[item for item in self.gateway.issues[key].links if item.other.key != other])
+
+    def synced(self):
+        """Every file pulled; what is sent from now on is what the test did."""
+        self.pull()
+        self.files.writes.clear()
+        self.gateway.calls.clear()
+
+    def bring_in(self):
+        """What Jira holds now is in the files; what is sent from now on is what the test did."""
+        self.pull(update=True)
+        self.files.writes.clear()
+        self.gateway.calls.clear()
+
+    def line(self, key):
+        return MirrorFile.parse(self.text_of(key)).get("links")
+
+    def write_line(self, key, line):
+        """The person adds the `links:` line to a file, or changes it."""
+        if MirrorFile.parse(self.text_of(key)).has("links"):
+            self.edit(key, f"links: {self.line(key)}".rstrip(), f"links: {line}")
+        else:
+            self.edit(key, "fix_versions: Release 1.0\n", f"fix_versions: Release 1.0\nlinks: {line}\n")
+
+    def push(self, key="PROJ-2", **options):
+        return self.app.push_mirror.execute(self.path_of(key), **options)
+
+    def entry(self, key):
+        return next(entry for entry in self.diff().entries if entry.key == key)
+
+    def creations(self):
+        return [call[1] for call in self.gateway.called("create_link")]
+
+
+class LinksPullTest(LinksFixture):
+    def test_a_new_file_lists_the_links_of_its_issue_from_its_side(self):
+        self.link("Blocks", "PROJ-1", "PROJ-2")
+        self.link("Has to be done after", "PROJ-3", "PROJ-1")
+        self.pull()
+        self.assertEqual(self.line("PROJ-1"), "Blocks -> PROJ-2, Has to be done after <- PROJ-3")  # PROJ-1 is the outward end of the first link and the inward end of the second
+        self.assertEqual(self.line("PROJ-2"), "Blocks <- PROJ-1")
+        self.assertEqual(self.line("PROJ-3"), "Has to be done after -> PROJ-1")
+        lines = self.text_of("PROJ-1").split("\n")
+        self.assertTrue(lines[lines.index("fix_versions: Release 1.0") + 1].startswith("links: "))
+        self.assertEqual(self.pending(), {})  # everything is in step
+
+    def test_a_file_of_an_issue_without_links_has_no_such_line_but_a_record(self):
+        self.pull()
+        for key in ("PROJ-1", "PROJ-4"):
+            file = MirrorFile.parse(self.text_of(key))
+            self.assertFalse(file.has("links"))
+            self.assertIn("links", file.base)
+        self.assertEqual(self.pull().count("unchanged"), 6)
+
+    def test_what_is_written_holds_a_key_and_a_type_name_and_nothing_else(self):
+        self.put("PROJ-2", summary="Ask [~jdoe] about the report", description="Mail jane.doe@example.com")
+        self.link("Blocks", "PROJ-1", "PROJ-2")
+        self.pull()
+        self.assertEqual(self.line("PROJ-1"), "Blocks -> PROJ-2")
+        for personal in ("jdoe", "Jane", "jane.doe"):
+            self.assertNotIn(personal, "\n".join(self.files.files.values()))
+        self.assertNotIn("about the report", self.text_of("PROJ-1"))  # the summary of the other issue is no part of the line
+
+    def test_a_link_that_jira_gained_is_news_to_the_file_and_waits_for_update(self):
+        self.synced()
+        self.link("Blocks", "PROJ-1", "PROJ-2")
+        entry = self.entry("PROJ-1")
+        self.assertEqual((entry.state, entry.fields, entry.jira_fields, entry.local_fields), ("jira-changed", ["links"], ["links"], []))
+        outcome = self.pull().outcomes[0]
+        self.assertEqual((outcome.key, outcome.action, outcome.fields), ("PROJ-1", "skipped", ["links"]))
+        self.assertIn("--update", outcome.message)
+        self.assertEqual(self.files.writes, [])
+        before = self.text_of("PROJ-1")
+        self.assertEqual(self.pull(update=True, keys=["PROJ-1"]).outcomes[0].action, "updated")
+        after = self.text_of("PROJ-1")
+        self.assertEqual(self.line("PROJ-1"), "Blocks -> PROJ-2")
+        gone, new = set(before.split("\n")) - set(after.split("\n")), set(after.split("\n")) - set(before.split("\n"))
+        self.assertEqual((sorted(line.split(":")[0] for line in gone), sorted(line.split(":")[0] for line in new)), (["jira_base"], ["jira_base", "links"]))  # nothing else changed
+        self.assertEqual(self.states()["PROJ-2"], "jira-changed")  # the other end of the link is news to its file too
+        self.pull(update=True)
+        self.assertEqual(self.pending(), {})
+
+    def test_a_link_that_left_jira_leaves_the_line_of_a_file_that_was_not_edited(self):
+        self.link("Blocks", "PROJ-1", "PROJ-2")
+        self.synced()
+        self.unlink("PROJ-1", "PROJ-2")
+        self.assertEqual(self.entry("PROJ-1").jira_fields, ["links"])
+        self.pull(update=True)
+        self.assertEqual(self.line("PROJ-1"), "")
+        self.assertTrue(MirrorFile.parse(self.text_of("PROJ-1")).has("links"))  # the line stays, blank
+        self.assertEqual(self.pending(), {})
+
+    def test_a_link_written_in_the_file_is_an_edit_that_no_pull_touches_not_even_with_force(self):
+        self.synced()
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        entry = self.entry("PROJ-2")
+        self.assertEqual((entry.state, entry.fields, entry.local_fields), ("local-changed", ["links"], ["links"]))
+        before = self.text_of("PROJ-2")
+        for options in ({"update": True}, {"update": True, "force": True}):
+            outcome = self.pull(**options).outcomes[1]
+            self.assertEqual((outcome.action, self.text_of("PROJ-2")), ("skipped", before))
+            self.assertIn("jira push", outcome.message)
+        self.assertEqual(self.files.writes, [])
+
+    def test_the_same_links_changed_on_both_sides_are_a_conflict_that_force_decides_for_jira(self):
+        self.synced()
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.link("Relates", "PROJ-2", "PROJ-3")
+        self.assertEqual(self.entry("PROJ-2").state, "conflict")
+        before = self.text_of("PROJ-2")
+        result = self.pull(update=True)
+        self.assertEqual((result.outcomes[1].action, result.outcomes[1].fields, self.text_of("PROJ-2")), ("conflict", ["links"], before))
+        self.assertEqual((result.first_error.exit_code, result.first_error.details), (3, {"keys": ["PROJ-2"]}))
+        self.assertEqual(self.pull(update=True, force=True).first_error, None)
+        self.assertEqual(self.line("PROJ-2"), "Relates -> PROJ-3")  # Jira's links: the entry that was written here and not pushed is gone
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_an_edit_of_another_field_stays_when_a_link_comes_in(self):
+        self.synced()
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        entry = self.entry("PROJ-2")
+        self.assertEqual((entry.state, entry.local_fields, entry.jira_fields), ("mixed", ["summary"], ["links"]))
+        outcome = self.pull(update=True).outcomes[1]
+        self.assertEqual((outcome.action, outcome.fields), ("updated", ["links"]))
+        self.assertIn("your edit of summary stays", outcome.message)
+        self.assertIn("summary: Fixed here", self.text_of("PROJ-2"))
+        self.assertEqual(self.line("PROJ-2"), "Blocks -> PROJ-4")
+
+    def test_a_dry_run_of_an_update_writes_no_link(self):
+        self.synced()
+        self.link("Blocks", "PROJ-1", "PROJ-2")
+        outcome = self.pull(update=True, dry_run=True).outcomes[0]
+        self.assertEqual((outcome.action, outcome.fields, outcome.dry_run, self.files.writes), ("updated", ["links"], True, []))
+        self.assertFalse(MirrorFile.parse(self.text_of("PROJ-1")).has("links"))
+
+    def test_the_links_of_two_issues_are_both_written_by_one_pull(self):
+        self.synced()
+        self.link("Blocks", "PROJ-1", "PROJ-2")
+        result = self.pull(update=True)
+        self.assertEqual(sorted((outcome.key, outcome.action) for outcome in result.outcomes if outcome.action != "unchanged"), [("PROJ-1", "updated"), ("PROJ-2", "updated")])
+
+    def test_a_link_type_that_a_line_cannot_hold_is_left_out_and_said(self):
+        self.put("PROJ-1", links=[IssueLink("Data, Quality", "relates to", "outward", IssueRef("PROJ-2"))])
+        self.pull()
+        self.assertFalse(MirrorFile.parse(self.text_of("PROJ-1")).has("links"))
+        entry = self.entry("PROJ-1")
+        self.assertEqual((entry.state, entry.fields), ("same", []))  # the links of that issue are not compared
+        self.assertIn("comma", entry.skipped["links"])
+        self.assertIn("comma", self.pull().skipped["PROJ-1"]["links"])
+        self.assertNotIn("links", MirrorFile.parse(self.text_of("PROJ-1")).base)  # no record of what is not compared
+        self.assertIn("links", MirrorFile.parse(self.text_of("PROJ-2")).base)
+
+
+class LinksDiffTest(LinksFixture):
+    def test_a_link_only_the_file_lists_is_edited_here_and_a_link_only_jira_holds_is_changed_there(self):
+        self.synced()
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.link("Relates", "PROJ-1", "PROJ-3")
+        entries = {entry.key: entry for entry in self.diff().entries}
+        self.assertEqual((entries["PROJ-2"].state, entries["PROJ-2"].local_fields), ("local-changed", ["links"]))
+        self.assertEqual((entries["PROJ-1"].state, entries["PROJ-1"].jira_fields), ("jira-changed", ["links"]))
+        self.assertEqual((entries["PROJ-3"].state, entries["PROJ-3"].jira_fields), ("jira-changed", ["links"]))
+        self.assertEqual(entries["PROJ-4"].state, "same")  # its file lists nothing, and Jira has not heard of the link that was written into the other file
+
+    def test_a_link_in_both_places_is_in_step_whatever_its_spelling(self):
+        self.synced()
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.write_line("PROJ-2", "blocks->proj-4")
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_the_end_of_a_link_is_part_of_it(self):
+        self.synced()
+        self.link("Relates", "PROJ-2", "PROJ-4")
+        self.write_line("PROJ-2", "Relates <- PROJ-4")
+        entry = self.entry("PROJ-2")
+        self.assertEqual((entry.state, entry.conflicts), ("conflict", ["links"]))  # the file lists the link the other way round, and Jira has changed too
+
+    def test_a_diff_that_reads_links_changes_nothing(self):
+        self.synced()
+        self.link("Blocks", "PROJ-1", "PROJ-2")
+        self.write_line("PROJ-3", "Blocks -> PROJ-4")
+        before = dict(self.files.files)
+        self.diff()
+        self.assertEqual((self.files.files, self.files.writes), (before, []))
+        self.assertEqual([call for call in self.gateway.calls if call[0] in ("create_link", "update_issue")], [])
+
+    def test_the_links_are_asked_for_with_the_other_fields(self):
+        self.synced()
+        self.diff()
+        asked = self.gateway.called("search")
+        self.assertTrue(asked and all("issuelinks" in call[2] for call in asked))
+
+    def test_a_line_that_cannot_be_read_makes_that_file_unreadable_and_no_other(self):
+        self.synced()
+        self.write_line("PROJ-2", "Blocks > PROJ-4")
+        entries = {entry.key: entry for entry in self.diff().entries}
+        self.assertEqual(self.pending(), {"PROJ-2": "unreadable"})
+        self.assertIn("links line", entries["PROJ-2"].message)
+        outcome = next(item for item in self.pull(update=True).outcomes if item.key == "PROJ-2")
+        self.assertEqual(outcome.action, "skipped")
+        self.assertIn("Type -> KEY", outcome.message)
+
+    def test_a_file_that_links_its_issue_to_itself_is_unreadable(self):
+        self.synced()
+        self.write_line("PROJ-2", "Blocks -> PROJ-2")
+        self.assertIn("to itself", self.entry("PROJ-2").message)
+
+
+class LinksPushTest(LinksFixture):
+    def setUp(self):
+        super().setUp()
+        self.synced()
+
+    def test_a_dry_run_shows_the_requests_and_sends_nothing(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4, Has to be done after <- PROJ-3")
+        outcome = self.push(dry_run=True).outcomes[0]
+        self.assertEqual((outcome.action, outcome.fields, outcome.payload, outcome.dry_run), ("pushed", ["links"], None, True))
+        self.assertEqual([link.entry for link in outcome.links], ["Blocks -> PROJ-4", "Has to be done after <- PROJ-3"])
+        self.assertEqual([link.payload for link in outcome.links], [link_payload("Blocks", "PROJ-2", "PROJ-4"), link_payload("Has to be done after", "PROJ-3", "PROJ-2")])
+        self.assertEqual([link.relation for link in outcome.links], ["PROJ-2 blocks PROJ-4", "PROJ-2 requires PROJ-3"])
+        self.assertEqual((self.creations(), self.updates(), self.files.writes), ([], [], []))
+        self.assertEqual(self.gateway.called("get_issue")[-1][1:], ("PROJ-3", ("summary",)))  # the other issues were looked at: they exist
+
+    def test_a_push_creates_the_link_reads_the_issue_back_and_notes_the_agreement(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        result = self.push()
+        outcome = result.outcomes[0]
+        self.assertEqual((result.first_error, outcome.action, outcome.fields, outcome.payload, outcome.dry_run), (None, "pushed", ["links"], None, False))
+        self.assertEqual(self.creations(), [link_payload("Blocks", "PROJ-2", "PROJ-4")])
+        self.assertEqual(self.updates(), [])  # no field was edited: nothing is changed in the issue itself
+        self.assertEqual([(item.type_name, item.direction, item.other.key) for item in self.gateway.issues["PROJ-2"].links], [("Blocks", "outward", "PROJ-4")])
+        self.assertEqual([(item.type_name, item.direction, item.other.key) for item in self.gateway.issues["PROJ-4"].links], [("Blocks", "inward", "PROJ-2")])
+        self.assertEqual(self.gateway.called("get_issue")[-1][1], "PROJ-2")  # read back
+        self.assertEqual(self.files.writes, [self.path_of("PROJ-2")])
+        self.assertEqual(self.entry("PROJ-4").state, "jira-changed")  # the file of the other end is news
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_a_second_push_creates_nothing_and_a_link_is_never_created_twice(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.push()
+        again = self.push()
+        self.assertEqual((again.outcomes[0].action, again.outcomes[0].links), ("unchanged", []))
+        self.assertEqual(len(self.creations()), 1)
+
+    def test_the_end_of_the_issue_decides_which_issue_is_the_outward_one(self):
+        self.write_line("PROJ-2", "Blocks <- PROJ-4")
+        self.push()
+        self.assertEqual(self.creations(), [{"type": {"name": "Blocks"}, "outwardIssue": {"key": "PROJ-4"}, "inwardIssue": {"key": "PROJ-2"}}])
+        self.assertEqual(self.gateway.issues["PROJ-2"].links[0].direction, "inward")
+
+    def test_a_link_that_jira_holds_already_is_not_created_whatever_its_spelling(self):
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.bring_in()
+        self.write_line("PROJ-2", "blocks -> proj-4, Relates -> PROJ-3")
+        result = self.push()
+        self.assertEqual(self.creations(), [link_payload("Relates", "PROJ-2", "PROJ-3")])
+        self.assertEqual(result.outcomes[0].fields, ["links"])
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_a_link_that_jira_gained_since_is_not_created_a_second_time_either(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4, Relates -> PROJ-3")
+        self.link("Blocks", "PROJ-2", "PROJ-4")  # made in Jira after the file was edited: both sides changed the links
+        self.assertEqual(self.push().first_error.exit_code, 3)
+        self.assertEqual(self.creations(), [])
+        self.push(force=True)
+        self.assertEqual(self.creations(), [link_payload("Relates", "PROJ-2", "PROJ-3")])
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_a_file_that_lists_what_jira_holds_has_nothing_to_send(self):
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        outcome = self.push().outcomes[0]
+        self.assertEqual(outcome.action, "unchanged")
+        self.assertEqual((self.creations(), self.updates()), ([], []))
+
+    def test_the_same_link_written_into_both_files_is_created_once(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.write_line("PROJ-4", "Blocks <- PROJ-2")
+        self.push("PROJ-2")
+        self.assertEqual(self.states()["PROJ-4"], "same")  # Jira holds what that file lists, whoever created it
+        again = self.push("PROJ-4").outcomes[0]
+        self.assertEqual((again.action, again.links), ("unchanged", []))
+        self.assertEqual(len(self.creations()), 1)
+        self.assertEqual(self.pull().outcomes[3].action, "adopted")  # the next pull notes the agreement of the file that sent nothing
+        self.assertEqual(self.pending(), {})
+
+    def test_a_file_that_lost_the_whole_line_names_what_jira_still_holds(self):
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.bring_in()
+        self.edit("PROJ-2", "links: Blocks -> PROJ-4\n", "")  # the line is gone, not blank
+        outcome = self.push().outcomes[0]
+        self.assertEqual((outcome.action, outcome.jira_only_links), ("unchanged", ["Blocks -> PROJ-4"]))
+        self.assertEqual(self.creations(), [])
+
+    def test_a_file_whose_links_do_not_differ_does_not_ask_jira_for_anything_about_links(self):
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.bring_in()
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        self.push()
+        self.assertEqual((self.creations(), self.gateway.called("list_link_types")), ([], []))
+        self.assertEqual([call[1] for call in self.gateway.called("get_issue")], ["PROJ-2", "PROJ-2", "PROJ-2"])  # the read, the guard and the read back
+
+    def test_both_ends_of_one_relation_are_two_links(self):
+        self.link("Relates", "PROJ-2", "PROJ-4")
+        self.bring_in()
+        self.write_line("PROJ-2", "Relates -> PROJ-4, Relates <- PROJ-4")
+        outcome = self.push().outcomes[0]
+        self.assertEqual(outcome.action, "pushed")
+        self.assertEqual(self.creations(), [link_payload("Relates", "PROJ-4", "PROJ-2")])  # Jira stores a link with a direction
+
+    def test_an_unknown_type_is_refused_with_the_names_that_exist_and_nothing_is_sent(self):
+        self.write_line("PROJ-2", "Blokcs -> PROJ-4")
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")  # the whole push is refused, the summary too
+        result = self.push()
+        self.assertIsInstance(result.first_error, ValidationError)
+        self.assertIn("Blokcs", result.first_error.message)
+        self.assertIn("PROJ-2-fix-the-thing.md", result.first_error.message)
+        self.assertIn("Available: Blocks, Has to be done after, Pre-requisite", result.first_error.hint)
+        self.assertEqual((result.outcomes[0].action, self.creations(), self.updates(), self.files.writes), ("refused", [], [], []))
+        self.assertEqual(self.push(dry_run=True).first_error.message, result.first_error.message)  # a dry run finds it too
+
+    def test_a_phrase_is_no_type(self):
+        self.write_line("PROJ-2", "blocks -> PROJ-4")  # the name is Blocks, which is also the phrase: fine
+        self.assertIsNone(self.push(dry_run=True).first_error)
+        self.write_line("PROJ-2", "is blocked by -> PROJ-4")
+        self.assertIsInstance(self.push(dry_run=True).first_error, ValidationError)
+
+    def test_a_type_name_with_umlauts_goes_through_the_file_and_is_found_whatever_its_case(self):
+        self.gateway.link_types.append(LinkType("5", "Abhängig von", "hängt ab von", "ist Voraussetzung für"))
+        self.write_line("PROJ-2", "ABHÄNGIG VON -> PROJ-4")
+        self.assertEqual(self.push().first_error, None)
+        self.assertEqual(self.creations(), [link_payload("Abhängig von", "PROJ-2", "PROJ-4")])
+        self.pull(update=True)
+        self.assertEqual(self.line("PROJ-4"), "Abhängig von <- PROJ-2")  # Jira's spelling comes back into the file
+        self.assertEqual(self.states()["PROJ-4"], "same")
+
+    def test_an_unknown_issue_is_refused_with_not_found_and_nothing_is_sent(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-77")
+        for dry_run in (True, False):
+            result = self.push(dry_run=dry_run)
+            self.assertIsInstance(result.first_error, NotFoundError)
+            self.assertEqual(result.first_error.exit_code, 4)
+            self.assertIn("PROJ-77 does not exist", result.first_error.message)
+        self.assertEqual((self.creations(), self.files.writes), ([], []))
+
+    def test_the_fields_go_first_with_their_guard_and_the_links_after_them(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        outcome = self.push().outcomes[0]
+        self.assertEqual((outcome.fields, outcome.payload), (["summary", "links"], {"fields": {"summary": "Fixed here"}}))
+        names = [call[0] for call in self.gateway.calls if call[0] in ("update_issue", "create_link")]
+        self.assertEqual(names, ["update_issue", "create_link"])
+        self.assertEqual(self.updates(), [("update_issue", "PROJ-2", {"fields": {"summary": "Fixed here"}})])
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_a_change_of_the_issue_since_it_was_read_stops_the_fields_and_the_links(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        real = self.gateway.get_issue
+
+        def racing(key, *, fields=None):
+            issue = real(key, fields=fields)
+            if fields is not None and tuple(fields) == ("summary", "updated"):
+                return dataclasses.replace(issue, updated="2026-10-25T09:00:00.000+0200")
+            return issue
+
+        self.gateway.get_issue = racing
+        result = self.push()
+        self.assertEqual((result.first_error.exit_code, self.updates(), self.creations()), (3, [], []))
+
+    def test_a_dry_run_with_a_summary_and_a_link_shows_both_requests(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        outcome = self.push(dry_run=True).outcomes[0]
+        self.assertEqual((outcome.fields, outcome.payload, len(outcome.links)), (["summary", "links"], {"fields": {"summary": "Fixed here"}}, 1))
+
+    def test_a_link_that_the_file_no_longer_lists_is_named_and_not_removed(self):
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.link("Relates", "PROJ-3", "PROJ-2")
+        self.bring_in()
+        self.assertEqual(self.line("PROJ-2"), "Blocks -> PROJ-4, Relates <- PROJ-3")
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        outcome = self.push().outcomes[0]
+        self.assertEqual((outcome.action, outcome.fields, outcome.links, outcome.jira_only_links), ("unchanged", ["links"], [], ["Relates <- PROJ-3"]))
+        self.assertIn("Relates <- PROJ-3: jira has it; remove it in Jira", outcome.message)
+        self.assertEqual((self.creations(), self.updates(), self.files.writes), ([], [], []))
+        self.assertEqual(len(self.gateway.issues["PROJ-2"].links), 2)  # still there
+
+    def test_that_is_no_conflict_and_the_other_fields_go_with_it(self):
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.bring_in()
+        self.write_line("PROJ-2", "")
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        result = self.push()
+        outcome = result.outcomes[0]
+        self.assertEqual((result.first_error, outcome.action, outcome.fields, outcome.payload), (None, "pushed", ["summary"], {"fields": {"summary": "Fixed here"}}))
+        self.assertEqual(outcome.jira_only_links, ["Blocks -> PROJ-4"])
+        self.assertIn("jira has it; remove it in Jira", outcome.message)
+        self.assertEqual(self.gateway.issues["PROJ-2"].summary, "Fixed here")
+        self.assertEqual(self.creations(), [])
+
+    def test_what_was_removed_stays_a_difference_until_it_is_removed_in_jira(self):
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.bring_in()
+        self.write_line("PROJ-2", "")
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        self.push()
+        entry = self.entry("PROJ-2")
+        self.assertEqual((entry.state, entry.fields, entry.local_fields), ("local-changed", ["links"], ["links"]))  # the summary is agreed, the link is not
+        again = self.push().outcomes[0]
+        self.assertEqual((again.action, again.jira_only_links), ("unchanged", ["Blocks -> PROJ-4"]))  # and it is said every time
+        self.unlink("PROJ-2", "PROJ-4")  # removed in Jira, where only a person can do it
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_a_removed_link_that_jira_still_holds_is_not_put_back_by_a_pull(self):
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.synced()
+        self.pull(update=True)
+        self.write_line("PROJ-2", "")
+        before = self.text_of("PROJ-2")
+        self.assertEqual(self.pull(update=True, force=True).outcomes[1].action, "skipped")
+        self.assertEqual(self.text_of("PROJ-2"), before)
+
+    def test_force_in_a_conflict_creates_what_the_file_lists_and_names_what_only_jira_holds(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.link("Relates", "PROJ-2", "PROJ-3")
+        refused = self.push()
+        self.assertEqual((refused.first_error.exit_code, refused.outcomes[0].action, self.creations()), (3, "refused", []))
+        self.assertIn("links", refused.first_error.message)
+        forced = self.push(force=True).outcomes[0]
+        self.assertEqual((forced.action, forced.fields, forced.jira_only_links), ("pushed", ["links"], ["Relates -> PROJ-3"]))
+        self.assertEqual(self.creations(), [link_payload("Blocks", "PROJ-2", "PROJ-4")])
+
+    def test_links_that_jira_gained_are_not_reverted_and_an_edit_of_another_field_goes(self):
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        outcome = self.push().outcomes[0]
+        self.assertEqual((outcome.action, outcome.fields, self.creations()), ("pushed", ["summary"], []))
+        self.assertIn("Jira changed links meanwhile", outcome.message)
+
+    def test_a_link_that_is_to_be_created_names_its_trouble_when_jira_refuses_the_permission(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.gateway.errors["create_link"] = AuthError("Jira refused this request (HTTP 403).", hint="Ask a Jira administrator.", details={"status": 403})
+        result = self.push()
+        self.assertIsInstance(result.first_error, AuthError)
+        self.assertEqual(result.first_error.exit_code, 5)
+        self.assertIn("PROJ-2 blocks PROJ-4", result.first_error.message)
+        self.assertIn("'Link Issues' permission", result.first_error.hint)
+        self.assertEqual((result.outcomes[0].action, self.files.writes), ("refused", []))
+
+    def test_a_401_on_the_link_is_a_missing_permission_too_as_the_reference_says(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.gateway.errors["create_link"] = AuthError("Jira did not accept the token (HTTP 401).", hint="Create a new token.", details={"status": 401})
+        result = self.push()
+        self.assertEqual((result.first_error.exit_code, result.outcomes[0].action), (5, "refused"))
+        self.assertIn("'Link Issues' permission", result.first_error.hint)
+        self.assertEqual(result.first_error.details["link"], "Blocks -> PROJ-4")
+
+    def test_a_404_on_the_link_says_that_linking_may_be_disabled_or_an_issue_not_visible(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.gateway.errors["create_link"] = NotFoundError("Not found: POST /issueLink", details={"status": 404})
+        result = self.push()
+        self.assertEqual((result.first_error.exit_code, result.outcomes[0].action), (4, "refused"))
+        self.assertIn("PROJ-2 blocks PROJ-4", result.first_error.message)
+        self.assertIn("disabled", result.first_error.hint)
+
+    def test_a_jira_without_link_types_says_that_linking_seems_disabled_and_nothing_is_sent(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.gateway.errors["list_link_types"] = NotFoundError("Not found: GET /issueLinkType", details={"status": 404})
+        for dry_run in (True, False):
+            result = self.push(dry_run=dry_run)
+            self.assertEqual(result.first_error.exit_code, 4)
+            self.assertIn("issue linking seems to be disabled", result.first_error.message)
+        self.assertEqual((self.creations(), self.files.writes), ([], []))
+
+    def test_the_types_are_asked_for_only_when_a_link_is_to_be_created(self):
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        self.push()
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.bring_in()
+        self.write_line("PROJ-2", "")
+        self.push()
+        self.assertEqual(self.gateway.called("list_link_types"), [])
+
+    def test_a_link_that_fails_after_another_went_through_ends_the_run_and_the_next_push_does_the_rest(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4, Relates -> PROJ-3")
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        real, calls = self.gateway.create_link, []
+
+        def failing_second(payload):
+            calls.append(payload)
+            if len(calls) == 2:
+                raise RejectedError("Jira refused the request (HTTP 400): no.", hint="No.")
+            real(payload)
+
+        self.gateway.create_link = failing_second
+        result = self.push()
+        outcome = result.outcomes[0]
+        self.assertIsInstance(result.first_error, RejectedError)
+        self.assertEqual((outcome.action, outcome.fields, [link.entry for link in outcome.links]), ("pushed", ["summary", "links"], ["Blocks -> PROJ-4"]))
+        self.assertIn("links not created (Relates -> PROJ-3): Jira refused the request", outcome.message)
+        self.assertEqual(self.gateway.issues["PROJ-2"].summary, "Fixed here")
+        self.assertEqual([item.other.key for item in self.gateway.issues["PROJ-2"].links], ["PROJ-4"])
+        self.assertEqual(self.entry("PROJ-2").fields, ["links"])  # the summary is agreed, the links wait
+        self.gateway.create_link = real
+        self.gateway.calls.clear()
+        self.assertEqual(self.push().first_error, None)
+        self.assertEqual(self.creations(), [link_payload("Relates", "PROJ-2", "PROJ-3")])  # only what is missing: nothing is created twice
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_a_failure_before_anything_went_through_is_a_refusal(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.gateway.errors["create_link"] = RejectedError("Jira refused the request (HTTP 400): no.", hint="No.")
+        result = self.push()
+        self.assertEqual((result.outcomes[0].action, result.first_error.exit_code, self.files.writes), ("refused", 6, []))
+
+    def test_a_file_that_cannot_be_written_after_the_link_is_no_refusal(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.files.locked.add(self.path_of("PROJ-2"))
+        outcome = self.push().outcomes[0]
+        self.assertEqual((outcome.action, outcome.fields), ("pushed", ["links"]))
+        self.assertIn("Jira holds the change", outcome.message)
+        self.files.locked.clear()
+        self.assertEqual(self.pull().outcomes[1].action, "adopted")  # the next pull notes the state
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_several_files_push_their_links_one_after_the_other_and_stop_at_the_first_refusal(self):
+        self.write_line("PROJ-1", "Blocks -> PROJ-3")
+        self.write_line("PROJ-2", "Blokcs -> PROJ-3")
+        self.write_line("PROJ-4", "Blocks -> PROJ-3")
+        result = self.app.push_mirror.execute(DIR, keys=["PROJ-1", "PROJ-2", "PROJ-4"])
+        self.assertEqual([outcome.action for outcome in result.outcomes], ["pushed", "refused"])
+        self.assertEqual(self.creations(), [link_payload("Blocks", "PROJ-1", "PROJ-3")])
+
+    def test_the_file_is_the_only_thing_written_and_no_person_is_asked_for(self):
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.push()
+        asked = [call[2] for call in self.gateway.called("get_issue")]
+        self.assertTrue(all("assignee" not in (fields or ()) and "reporter" not in (fields or ()) for fields in asked))
+        self.assertEqual(self.files.writes, [self.path_of("PROJ-2")])
+
+    def test_a_line_that_cannot_be_read_is_refused_and_nothing_is_sent(self):
+        self.write_line("PROJ-2", "Blocks > PROJ-4")
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        result = self.push()
+        self.assertIsInstance(result.first_error, ValidationError)
+        self.assertIn("links line", result.first_error.message)
+        self.assertEqual((result.outcomes[0].action, self.updates(), self.creations()), ("refused", [], []))
+
+    def test_a_link_type_that_a_line_cannot_hold_is_named_as_not_compared(self):
+        self.put("PROJ-3", links=[IssueLink("Data, Quality", "relates to", "outward", IssueRef("PROJ-4"))])
+        self.edit("PROJ-3", "labels: backend", "labels: backend,api")
+        outcome = self.push("PROJ-3").outcomes[0]
+        self.assertEqual((outcome.action, outcome.fields, outcome.message), ("pushed", ["labels"], "not compared: links"))
+        self.assertEqual(self.creations(), [])
+
+
+class LinksFromVersion1Test(LinksFixture):
+    """A file that `jira pull` of version 1.0.0 wrote: its record has no entry for the links, and the file has no line for them."""
+
+    def strip_record(self, key):
+        path = self.path_of(key)
+        file = MirrorFile.parse(self.files.files[path])
+        file.remove("links")
+        kept = {name: pair for name, pair in (file.base or {}).items() if name != "links"}
+        file.set("jira_base", ",".join(f"{name}={own}/{theirs}" for name, (own, theirs) in kept.items()))
+        self.files.files[path] = file.render()
+
+    def old_files(self, *keys):
+        self.pull()
+        for key in keys:
+            self.strip_record(key)
+        self.files.writes.clear()
+        self.gateway.calls.clear()
+
+    def test_the_first_pull_of_a_file_in_step_only_records_the_agreement(self):
+        self.old_files("PROJ-1", "PROJ-2")
+        self.assertNotIn("links", MirrorFile.parse(self.text_of("PROJ-2")).base)
+        self.assertEqual(self.pending(), {})
+        before = self.text_of("PROJ-2")
+        outcome = self.pull(keys=["PROJ-2"]).outcomes[0]
+        self.assertEqual((outcome.action, outcome.fields), ("adopted", []))
+        after = self.text_of("PROJ-2")
+        self.assertIn("links", MirrorFile.parse(after).base)
+        self.assertEqual([line for line in after.split("\n") if not line.startswith(("jira_base:", "jira_synced:"))], [line for line in before.split("\n") if not line.startswith(("jira_base:", "jira_synced:"))])
+        self.assertEqual(self.pull(keys=["PROJ-2"]).outcomes[0].action, "unchanged")
+
+    def test_a_dry_run_of_that_first_pull_writes_nothing(self):
+        self.old_files("PROJ-2")
+        self.assertEqual(self.pull(keys=["PROJ-2"], dry_run=True).outcomes[0].action, "adopted")
+        self.assertEqual(self.files.writes, [])
+
+    def test_the_links_that_jira_holds_are_news_to_such_a_file_and_update_writes_them(self):
+        self.old_files("PROJ-2")
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        entry = self.entry("PROJ-2")
+        self.assertEqual((entry.state, entry.jira_fields, entry.unknown), ("jira-changed", ["links"], []))  # no `differs`: nobody agreed on what did not exist
+        self.assertEqual(self.pull().outcomes[1].action, "skipped")
+        self.assertEqual(self.pull(update=True).outcomes[1].action, "updated")
+        self.assertEqual(self.line("PROJ-2"), "Blocks -> PROJ-4")
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_a_push_of_another_field_works_whatever_jira_holds(self):
+        self.old_files("PROJ-2")
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        self.edit("PROJ-2", "summary: Fix the thing", "summary: Fixed here")
+        result = self.push()
+        outcome = result.outcomes[0]
+        self.assertEqual((result.first_error, outcome.action, outcome.fields), (None, "pushed", ["summary"]))
+        self.assertIn("Jira changed links meanwhile", outcome.message)
+        self.assertEqual(self.creations(), [])
+
+    def test_a_link_written_into_such_a_file_is_pushed_without_force(self):
+        self.old_files("PROJ-2")
+        self.write_line("PROJ-2", "Blocks -> PROJ-4")
+        self.assertEqual(self.entry("PROJ-2").state, "local-changed")
+        result = self.push()
+        self.assertEqual((result.first_error, result.outcomes[0].action), (None, "pushed"))
+        self.assertEqual(self.creations(), [link_payload("Blocks", "PROJ-2", "PROJ-4")])
+        self.assertIn("links", MirrorFile.parse(self.text_of("PROJ-2")).base)
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_two_links_written_into_such_a_file_of_which_one_fails_leave_the_other_to_the_next_push(self):
+        self.old_files("PROJ-2")
+        self.write_line("PROJ-2", "Blocks -> PROJ-4, Has to be done after -> PROJ-3")
+        real, calls = self.gateway.create_link, []
+
+        def failing_second(payload):
+            calls.append(payload)
+            if len(calls) == 2:
+                raise RejectedError("Jira refused the request (HTTP 400): no.", hint="No.")
+            real(payload)
+
+        self.gateway.create_link = failing_second
+        self.assertIsInstance(self.push().first_error, RejectedError)
+        self.assertEqual(self.entry("PROJ-2").state, "local-changed")  # an edit that is half done, not a conflict
+        self.gateway.create_link = real
+        self.gateway.calls.clear()
+        self.assertIsNone(self.push().first_error)
+        self.assertEqual(self.creations(), [link_payload("Has to be done after", "PROJ-2", "PROJ-3")])
+        self.assertEqual(self.states()["PROJ-2"], "same")
+
+    def test_a_file_without_any_record_is_judged_the_same_for_its_links(self):
+        self.pull()
+        path = self.path_of("PROJ-2")
+        self.files.files[path] = "\n".join(line for line in self.files.files[path].split("\n") if not line.startswith(("jira_base:", "jira_synced:")))
+        self.link("Blocks", "PROJ-2", "PROJ-4")
+        entry = self.entry("PROJ-2")
+        self.assertEqual((entry.state, entry.jira_fields, entry.unknown), ("jira-changed", ["links"], []))
+
+    def test_a_planning_mirror_file_that_lists_no_links_is_in_step_for_an_issue_that_has_none(self):
+        self.put("PROJ-4", summary="Schedule the report", labels=["reporting"], priority="Very High", components=["Reporting"], fix_versions=["Release 1.0"], story_points=5.0, acceptance="1. *GIVEN* a user.", description="h2. User story\n\nAs an admin.\n")
+        self.files.files[f"{DIR}/032-story.md"] = (
+            "---\nsource_id: 32\nproject:\nissuetype: Story\nsummary: Schedule the report\nlabels: reporting\npriority: Very High\n"
+            "components: Reporting\nfix_versions: Release 1.0\nassignee:\njira_key: PROJ-4\n"
+            'fields_json: {"customfield_10001":5.0,"customfield_10004":"1. *GIVEN* a user."}\n---\n\n## User story\n\nAs an admin.\n'
+        )
+        self.assertEqual(self.states(keys=["PROJ-4"]), {"PROJ-4": "same"})
+        self.assertEqual(self.pull(keys=["PROJ-4"]).outcomes[0].action, "adopted")
+        self.assertIn("links", MirrorFile.parse(self.files.files[f"{DIR}/032-story.md"]).base)
+
+
+class LinksOfTheFirstPullTest(LinksFixture):
+    def test_the_first_pull_writes_the_links_and_the_second_has_nothing_to_do(self):
+        self.link("Blocks", "PROJ-1", "PROJ-2")
+        self.pull()
+        self.files.writes.clear()
+        result = self.pull()
+        self.assertEqual((result.count("unchanged"), self.files.writes), (6, []))
+
+    def test_a_dry_run_of_the_first_pull_writes_no_line(self):
+        self.link("Blocks", "PROJ-1", "PROJ-2")
+        result = self.pull(dry_run=True)
+        self.assertEqual((result.count("created"), self.files.files), (6, {}))
 
 
 if __name__ == "__main__":

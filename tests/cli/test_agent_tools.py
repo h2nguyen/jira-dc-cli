@@ -15,6 +15,7 @@ from jira_dc_cli.adapters.driving.cli.help import (
     mcp_tools,
     render_command_help,
 )
+from jira_dc_cli.adapters.driving.cli.mcp_calls import OVERWRITES
 from jira_dc_cli.adapters.driving.cli.parser import build_parser
 from jira_dc_cli.adapters.driving.cli.registry import all_commands, find_command
 from jira_dc_cli.adapters.driving.cli.spec import Arg, Command
@@ -22,8 +23,8 @@ from jira_dc_cli.version import __version__
 from tests.support.cli import run_cli
 
 JSON_TYPES = {"string", "integer", "number", "boolean"}
-ADDITIVE = {"comment", "link", "create", "create-json"}  # they add and never replace, move or remove
-FOR_THE_PERSON = ("setup-pat", "remove-pat", "config", "use", "clear-project", "api", "help", "commands", "skill", "changelog", "wiki")  # `wiki` prints any file it is given
+ADDITIVE = {"link", "create", "create-json", "sprint-create", "log-work", "attach"}  # they add and never replace, move or remove
+FOR_THE_PERSON = ("setup-pat", "remove-pat", "config", "use", "clear-project", "api", "help", "commands", "skill", "changelog", "wiki", "mcp")  # `wiki` prints any file it is given; `mcp` is the server that offers the tools
 FRONT_MATTER_LINES = {"jira_key", "jira_base", "jira_synced"}  # they look like tool names in a description of `diff`, `pull` and `push`
 
 
@@ -93,10 +94,19 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual(by_name["jira_import_md_dir"]["inputSchema"]["required"], ["directory"])
 
     def test_the_total_stays_small_enough_to_load_into_a_context(self):
-        read = json.dumps(mcp_tools(all_commands(), __version__, only="read"), ensure_ascii=False)
-        self.assertLess(len(read), 45_000)
-        for tool in tools():
-            self.assertLess(len(json.dumps(tool, ensure_ascii=False)), 7_500, tool["name"])
+        """A tool costs about two kilobytes; a client that wants fewer asks for a group (`jira mcp --group Read`). The fixed budget of the
+        first release (45,000 characters) held 26 tools; with the agile, attachment, reference and collaboration commands there are
+        more, so the check is the cost of one tool, a hard cap for the set that a server offers by default (the read set: it does not
+        hold the three tools that write files) and one for the whole catalogue."""
+        listed = mcp_tools(all_commands(), __version__, only="read")
+        read = json.dumps(listed, ensure_ascii=False)
+        self.assertLess(len(read) / len(listed["tools"]), 2_200)
+        self.assertLess(len(read), 95_000)
+        for over_mcp in (False, True):  # the catalogue, and the tools as `jira mcp` offers them (a few sentences longer)
+            everything = mcp_tools(all_commands(), __version__, only="all", over_mcp=over_mcp)
+            self.assertLess(len(json.dumps(everything, ensure_ascii=False)), 175_000)
+            for tool in everything["tools"]:
+                self.assertLess(len(json.dumps(tool, ensure_ascii=False)), 7_500, tool["name"])
 
 
 class WhatIsOfferedTest(unittest.TestCase):
@@ -107,20 +117,22 @@ class WhatIsOfferedTest(unittest.TestCase):
         self.assertTrue(MCP_EXCLUDED <= {command.name for command in all_commands()})  # no stale name in the list
         self.assertEqual(set(FOR_THE_PERSON), set(MCP_EXCLUDED))
 
-    def test_the_default_set_changes_nothing_in_jira(self):
+    def test_the_default_set_changes_nothing_in_jira_and_writes_no_file(self):
         by_name = {command.name: command for command in all_commands()}
-        for tool in tools("read"):
+        read = tools("read")
+        for tool in read:
             with self.subTest(tool=tool["name"]):
                 command = by_name[tool["_meta"]["jira"]["command"][1]]
                 self.assertFalse(command.writes)
-                if command.name in MCP_FILES:
-                    continue  # it writes files, not issues: see the next test
+                self.assertNotIn(command.name, MCP_FILES)  # a tool that writes a file is not a tool that only reads
                 self.assertTrue(tool["annotations"]["readOnlyHint"])
                 self.assertNotIn("destructiveHint", tool["annotations"])  # meaningless for a read-only tool
+                self.assertNotIn("Writes files", tool["description"])
+        self.assertTrue({"jira_search", "jira_issue", "jira_attachments"} <= {tool["name"] for tool in read})  # reading stays whole
 
     def test_what_writes_files_says_so_and_is_not_read_only(self):
-        by_name = {tool["name"]: tool for tool in tools("read")}
-        self.assertEqual(MCP_FILES, {"pull", "export"})
+        by_name = {tool["name"]: tool for tool in tools("write")}
+        self.assertEqual(MCP_FILES, {"pull", "export", "download"})
         for name in MCP_FILES:
             tool = by_name["jira_" + name]
             with self.subTest(tool=tool["name"]):
@@ -128,6 +140,7 @@ class WhatIsOfferedTest(unittest.TestCase):
                 self.assertTrue(tool["annotations"]["destructiveHint"])  # `--update`, `--out` and a file that exists are overwritten
                 self.assertTrue(tool["annotations"]["idempotentHint"])
                 self.assertIn("Does not change Jira. Writes files", tool["description"])
+                self.assertNotIn("jira_" + name, {tool["name"] for tool in tools("read")})
 
     def test_an_answer_that_would_show_people_is_asked_without_them(self):
         by_name = {tool["name"]: tool["_meta"]["jira"] for tool in tools("read")}
@@ -148,18 +161,25 @@ class WhatIsOfferedTest(unittest.TestCase):
                 self.assertFalse(annotations["readOnlyHint"])
                 self.assertIsInstance(annotations["destructiveHint"], bool)
                 self.assertIsInstance(annotations["idempotentHint"], bool)
-                self.assertIn("Changes Jira", tool["description"])
+                if tool["_meta"]["jira"]["command"][1] in MCP_FILES:
+                    self.assertIn("Does not change Jira. Writes files", tool["description"])  # it writes files, not issues
+                else:
+                    self.assertIn("Changes Jira", tool["description"])
         self.assertEqual(len(tools("all")), len(tools("read")) + len(tools("write")))
+        self.assertEqual(
+            {tool["name"] for tool in tools("write")} - {"jira_" + name for name in MCP_FILES},
+            {"jira_" + command.name.replace("-", "_") for command in all_commands() if command.writes and command.name not in MCP_EXCLUDED},
+        )
 
     def test_a_write_tool_says_exactly_how_far_it_goes(self):
         by_name = {tool["name"]: tool["annotations"] for tool in tools("write")}
-        for name in ("update", "update_json", "transition", "import_md", "import_md_dir", "import_csv", "push"):
-            self.assertTrue(by_name["jira_" + name]["destructiveHint"], name)  # it overwrites or moves
-        for name in ("create", "create_json", "comment", "link"):
+        for name in ("update", "update_json", "transition", "import_md", "import_md_dir", "import_csv", "push", "comment", "assign", "sprint_add", "rank", "epic_add", "sprint_update", "watch", "vote", "remote_link"):
+            self.assertTrue(by_name["jira_" + name]["destructiveHint"], name)  # it overwrites or moves; `comment` can edit one
+        for name in ("create", "create_json", "link", "sprint_create", "log_work"):
             self.assertFalse(by_name["jira_" + name]["destructiveHint"], name)  # it only adds
-        for name in ("update", "update_json", "push"):
+        for name in ("update", "update_json", "push", "assign", "sprint_add", "rank", "epic_add", "sprint_update", "watch", "vote"):
             self.assertTrue(by_name["jira_" + name]["idempotentHint"], name)  # the same call again changes nothing more
-        for name in ("create", "comment", "link", "transition", "import_md"):
+        for name in ("create", "comment", "link", "transition", "import_md", "sprint_create", "log_work", "remote_link"):
             self.assertFalse(by_name["jira_" + name]["idempotentHint"], name)
 
     def test_every_command_that_changes_jira_is_classified(self):
@@ -185,6 +205,71 @@ class WhatIsOfferedTest(unittest.TestCase):
             mcp_tools(all_commands(), __version__, only="some")
 
 
+class OverMcpTest(unittest.TestCase):
+    """The same tools as `jira mcp` offers them (`over_mcp`): where the server differs from a shell it says so, and the catalogue, which is for
+    a program that runs `jira NAME` in a shell where `--force` works, does not."""
+
+    @staticmethod
+    def served(only="all"):
+        return {tool["name"]: tool for tool in mcp_tools(all_commands(), __version__, only=only, over_mcp=True)["tools"]}
+
+    def test_the_catalogue_says_that_a_tool_that_writes_files_can_overwrite_them_and_the_server_says_what_it_does_instead(self):
+        catalogue = {tool["name"]: tool for tool in tools("write")}
+        served = self.served("write")
+        for name in sorted(MCP_FILES):
+            with self.subTest(tool=name):
+                self.assertIn("Writes files in a folder and can overwrite them", catalogue["jira_" + name]["description"])
+                said = served["jira_" + name]["description"]
+                self.assertNotIn("can overwrite them", said)  # the sentence of the catalogue is not true over MCP
+                self.assertIn("Does not change Jira. Writes files below the working folder of the server.", said)
+                self.assertIn("it never replaces a file or an edit of yours: `force` is refused", said)
+
+    def test_a_property_that_the_server_refuses_says_so_and_the_catalogue_does_not(self):
+        for tool in served_tools("write", over_mcp=False):
+            for spec in tool["inputSchema"]["properties"].values():
+                self.assertFalse(spec["description"].startswith("Refused over MCP"), tool["name"])
+        for name in ("jira_download", "jira_pull", "jira_push"):
+            with self.subTest(tool=name):
+                tool = self.served("write")[name]
+                self.assertTrue(tool["inputSchema"]["properties"]["force"]["description"].startswith("Refused over MCP: "))
+                self.assertTrue(tool["description"].endswith("Over MCP `force` is refused: do not set it."))
+        self.assertNotIn("force", self.served("write")["jira_export"]["inputSchema"]["properties"])
+        self.assertNotIn("Over MCP `force`", self.served("write")["jira_export"]["description"])
+
+    def test_the_properties_that_are_described_as_refused_are_the_ones_that_the_server_refuses(self):
+        marked = {
+            (tool["_meta"]["jira"]["command"][1], prop)
+            for tool in self.served().values()
+            for prop, spec in tool["inputSchema"]["properties"].items()
+            if spec["description"].startswith("Refused over MCP")
+        }
+        refused = {(command, mcp_property_names(find_command(command))[argument]) for command, argument in OVERWRITES}
+        self.assertEqual(marked, refused)  # help.py finds `--force` by its name, mcp_calls.OVERWRITES says what the policy refuses
+
+    def test_everything_else_of_a_tool_is_as_in_the_catalogue(self):
+        catalogue = {tool["name"]: tool for tool in tools("all")}
+        served = self.served()
+        self.assertEqual(list(served), list(catalogue))
+        different = {name for name in catalogue if catalogue[name] != served[name]}
+        self.assertEqual(different, {"jira_download", "jira_pull", "jira_push", "jira_export"})
+        for name in different:
+            with self.subTest(tool=name):
+                for key in ("title", "annotations", "_meta"):
+                    self.assertEqual(catalogue[name][key], served[name][key])
+                self.assertEqual(
+                    {prop for prop in catalogue[name]["inputSchema"]["properties"]}, {prop for prop in served[name]["inputSchema"]["properties"]}
+                )
+                self.assertEqual(catalogue[name]["inputSchema"]["required"], served[name]["inputSchema"]["required"])
+
+    def test_the_command_that_prints_the_catalogue_prints_the_catalogue(self):
+        printed = json.loads(run_cli("commands", "--format", "mcp", "--only", "all").out)["tools"]
+        self.assertEqual(printed, tools("all"))
+
+
+def served_tools(only, *, over_mcp):
+    return mcp_tools(all_commands(), __version__, only=only, over_mcp=over_mcp)["tools"]
+
+
 class CommandLineTest(unittest.TestCase):
     """The description is only good if a call made from it is a command line that the parser reads as meant."""
 
@@ -197,6 +282,8 @@ class CommandLineTest(unittest.TestCase):
             wanted = arguments.get(names[arg.names[0]])
             if wanted is None or wanted is False:
                 continue
+            if arg.kind == "repeat":
+                wanted = [wanted]  # an option that may be given more than once: the parser collects the values in a list
             self.assertEqual(getattr(namespace, arg.dest), wanted, f"{tool['name']}: {arg.names[0]} in {argv}")
         self.assertEqual(bool(getattr(namespace, "json", False)), command.json_output)
 

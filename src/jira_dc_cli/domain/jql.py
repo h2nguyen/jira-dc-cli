@@ -5,6 +5,7 @@ import re
 from typing import Sequence
 
 from .errors import UsageError, ValidationError
+from .savedfilters import parse_filter_id
 from .searchterms import Term, Terms
 
 MATCH_MODES = ("all", "any")
@@ -25,7 +26,14 @@ def project_clause(project: str) -> str:
     return f"project = {quote(project)}"
 
 
-def issue_search(*, project: str = "", jql: str = "", mine: bool = False) -> str:
+def filter_clause(filter_id: str) -> str:
+    """`filter = 10000`: the issues of a saved filter. The id is checked, so that no text can add a clause."""
+    return f"filter = {parse_filter_id(filter_id)}"
+
+
+def issue_search(*, project: str = "", jql: str = "", mine: bool = False, filter_id: str = "") -> str:
+    if filter_id:
+        return _filter_search(filter_id, jql, mine)
     if mine:
         if jql:
             raise ValidationError("--mine cannot be combined with --jql")
@@ -39,6 +47,21 @@ def issue_search(*, project: str = "", jql: str = "", mine: bool = False) -> str
             hint="Run `jira use KEY`, pass --project KEY, or give a query with --jql.",
         )
     return f"{project_clause(project)} ORDER BY created DESC"
+
+
+def _filter_search(filter_id: str, jql: str, mine: bool) -> str:
+    """A saved filter replaces the project query, as `--jql` does. A `--jql` that goes with it narrows the filter (AND); its ORDER BY is kept."""
+    if mine:
+        raise ValidationError("--mine cannot be combined with --filter")
+    clause = filter_clause(filter_id)
+    condition, order = split_order_by(jql)
+    if condition and not _closes(condition):
+        raise ValidationError(
+            "--jql has a bracket or a quote that does not close.",
+            hint="The filter would not stay in force. Balance the brackets and quotes of your condition.",
+        )
+    parts = [f"{clause} AND ({condition})" if condition else clause, order]
+    return " ".join(part for part in parts if part)
 
 
 def report_search(project: str, *, sprint: str = "", fix_version: str = "") -> tuple[str, str]:
@@ -164,11 +187,12 @@ def search_query(
     fix_version: str = "",
     since: str = "",
     extra: str = "",
+    filter_id: str = "",
 ) -> str:
     """The query of `jira search`: the project (when one is chosen), the words and the filters, ANDed.
 
-    `extra` is a condition of your own that is added with AND; an ORDER BY in it is kept. Without words the newest issues come
-    first, with words Jira's relevance order stays."""
+    `extra` is a condition of your own that is added with AND; an ORDER BY in it is kept. `filter_id` adds a saved filter. Without
+    words the newest issues come first, with words Jira's relevance order stays."""
     condition, order = split_order_by(extra)
     if condition and not _closes(condition):
         raise ValidationError("--jql has a bracket or a quote that does not close.", hint="The other filters would not stay in force. Balance the brackets and quotes of your condition.")
@@ -179,6 +203,8 @@ def search_query(
     clauses: list[str] = []
     if project:
         clauses.append(project_clause(project))
+    if filter_id:
+        clauses.append(filter_clause(filter_id))
     if terms:
         clauses.append(text_clause(terms.used, match))
     if issue_types:

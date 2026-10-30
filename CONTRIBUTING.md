@@ -86,6 +86,10 @@ the rules by reading the imports of every module, and a failure names the file a
 - **One composition root.** Only `bootstrap.py` imports both sides, and nothing imports it except the entry points.
 - **The standard library only**, in the program and in the tools (`jira.py`, `install.py`, `scripts/`). No
   `requirements.txt`, `pyproject.toml`, `setup.py`, `Pipfile`, `poetry.lock` or `package.json`: there is nothing to install.
+- **Use only the calls that the Jira Data Center 11.3 REST API reference documents.** The mock Jira refuses every other call and the tests
+  assert that none was made (the one exception is the content address of an attachment, `GET /secure/attachment/{id}/{name}`, which is no
+  REST call); Jira Cloud endpoints and internal ones (`rest/greenhopper/*`) are out. See
+  [compatibility](docs/reference/compatibility.md).
 - **Every port has a test double** (`tests/support/fakes.py`) and, except `Diagnostics`, which lives with the command line,
   a real adapter. **Every command module is registered** in `commands/__init__.py`.
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ...application.ports import Clock, Files
 from ...domain.errors import ValidationError
-from .atomic import write_text_atomically
+from .atomic import write_bytes_atomically, write_bytes_exclusively, write_text_atomically
 
 
 class LocalFiles(Files):
@@ -25,6 +25,40 @@ class LocalFiles(Files):
             write_text_atomically(Path(path), text)
         except OSError as error:
             raise ValidationError(f"Cannot write {path}: {error.strerror or error}") from error
+
+    def read_bytes(self, path: str) -> bytes:
+        try:
+            return Path(path).read_bytes()
+        except OSError as error:
+            raise ValidationError(f"Cannot read {path}: {error.strerror or error}") from error
+
+    def write_bytes(self, path: str, data: bytes) -> None:
+        try:
+            write_bytes_atomically(Path(path), data)
+        except OSError as error:
+            raise ValidationError(f"Cannot write {path}: {error.strerror or error}") from error
+
+    def create_bytes(self, path: str, data: bytes) -> None:
+        """Only when nothing is at `path`: `FileExistsError` when something is there, also when it appeared a moment ago."""
+        try:
+            write_bytes_exclusively(Path(path), data)
+        except FileExistsError:
+            raise
+        except OSError as error:
+            raise ValidationError(f"Cannot write {path}: {error.strerror or error}") from error
+
+    def resolve(self, path: str) -> str:
+        """One name for a place, whatever way it was written: absolute, links followed, `..` folded, and on Windows without case."""
+        try:
+            return os.path.normcase(os.path.realpath(path))
+        except (OSError, ValueError):  # a name that cannot be resolved (a zero byte in it) stays as it is
+            return os.path.normcase(path)
+
+    def file_size(self, path: str) -> int:
+        try:
+            return Path(path).stat().st_size
+        except OSError as error:
+            raise ValidationError(f"Cannot read {path}: {error.strerror or error}") from error
 
     def append_text(self, path: str, text: str) -> None:
         try:

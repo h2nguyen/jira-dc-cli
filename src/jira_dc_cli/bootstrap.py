@@ -9,7 +9,9 @@ that needs no application (`help`, `version`) then starts without loading files,
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+from pathlib import Path
 from typing import Mapping, Sequence, TextIO
 
 from .adapters.driving.cli.main import run
@@ -32,7 +34,7 @@ def create_application(diagnostics: Diagnostics, environ: Mapping[str, str] | No
     from .adapters.driven.file_config import FileConfigStore
     from .adapters.driven.http_transport import HttpTransport
     from .adapters.driven.jira_rest import RestJiraGateway
-    from .adapters.driven.local_docs import LocalDocs
+    from .adapters.driven.local_docs import LocalDocs, find_root
     from .adapters.driven.paths import cache_directory, config_file
     from .adapters.driven.system import LocalFiles, SystemClock
 
@@ -40,7 +42,8 @@ def create_application(diagnostics: Diagnostics, environ: Mapping[str, str] | No
     store = FileConfigStore(config_file(env))
     settings = Settings.from_mapping(effective_values(store.load(), env))
     transport = HttpTransport(settings, debug=diagnostics.debug)
-    gateway = RestJiraGateway(settings, transport, FileCache(cache_directory(env)))
+    cache = FileCache(cache_directory(env))
+    gateway = RestJiraGateway(settings, transport, cache)
     return Application.create(
         settings=settings,
         gateway=gateway,
@@ -50,9 +53,26 @@ def create_application(diagnostics: Diagnostics, environ: Mapping[str, str] | No
         docs=LocalDocs(),
         diagnostics=diagnostics,
         environ=env,
-        runtime={"version": __version__, "python": sys.version.split()[0]},
+        runtime=runtime_facts(env, find_root()),
         closers=(transport.close,),
+        cache=cache,
     )
+
+
+def runtime_facts(environ: Mapping[str, str], root: Path) -> dict[str, str]:
+    """What `jira doctor` says about the program itself: the version, the Python, whether `jira` is found by name on the PATH
+    (and from where this run was started), and the installer that can put it there. The installer is named only in a source checkout:
+    the copy inside an installation refuses to install over itself."""
+    launcher = shutil.which("jira", path=environ.get("PATH")) or ""
+    installer = root / "install.py"
+    source_checkout = (root / "src" / "jira_dc_cli").is_dir()
+    return {
+        "version": __version__,
+        "python": sys.version.split()[0],
+        "launcher": launcher,
+        "program": sys.argv[0] if sys.argv else "",
+        "install_script": str(installer) if source_checkout and installer.is_file() else "",
+    }
 
 
 def _use_utf8(stream: TextIO, **options: str) -> None:

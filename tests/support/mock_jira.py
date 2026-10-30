@@ -22,6 +22,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .conformance import is_documented
+from .mock_extensions import EXTENSIONS
+
 POINTS, EPIC, SPRINT, ACCEPT = "customfield_10001", "customfield_10002", "customfield_10003", "customfield_10004"
 FIELD_NAMES = {POINTS: "Story Points", EPIC: "Epic Link", SPRINT: "Sprint", ACCEPT: "Acceptance criteria (DoD)"}
 USER = {"name": "jdoe", "key": "jdoe", "displayName": "Jane Doe", "emailAddress": "jane.doe@example.com", "self": "x"}
@@ -97,6 +100,7 @@ class Recorded:
     query: dict[str, list[str]]
     headers: dict[str, str]
     body: Any = None
+    raw: bytes = b""  # the body as it came, for a multipart upload
 
     @property
     def target(self) -> str:
@@ -341,10 +345,12 @@ class _Server(ThreadingHTTPServer):
 
 
 class MockJira:
-    def __init__(self, *, context_path: str = "/jira", page_cap: int = 2, token: str = "test-token") -> None:
+    def __init__(self, *, context_path: str = "/jira", page_cap: int = 2, token: str = "test-token", strict: bool = True) -> None:
         self.context_path = context_path
         self.page_cap = page_cap  # a server may return fewer results than asked for; the CLI must keep paging
         self.token = token
+        self.strict = strict  # refuse (404) every call that the Jira 11.3 REST API reference does not document, and list it
+        self.unknown_endpoints: list[str] = []
         self.gzip = True
         self.broken_gzip = False  # answer with a gzip header and a body that is not gzip
         self.issues = default_issues()
@@ -357,6 +363,7 @@ class MockJira:
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
         self._next_number = 100
+        self.extensions = [extension(self) for extension in EXTENSIONS]  # the routes of the feature areas, asked before the built-in ones
 
     # -- lifecycle ------------------------------------------------------------------------------
 
@@ -442,6 +449,7 @@ class MockJira:
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     jira: MockJira
+    raw_body: bytes = b""
 
     def log_message(self, *args: object) -> None:
         pass
@@ -465,9 +473,21 @@ class _Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def reply_bytes(self, status: int, data: bytes, content_type: str = "application/octet-stream", headers: dict[str, str] | None = None) -> None:
+        """A binary answer, such as an attachment. It is never compressed."""
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
     def read_body(self) -> Any:
         length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        self.raw_body = self.rfile.read(length) if length else b""  # kept as it came: a multipart upload is no text
+        raw = self.raw_body.decode("utf-8", "replace")
         try:
             return json.loads(raw) if raw else None
         except ValueError:
@@ -492,12 +512,18 @@ class _Handler(BaseHTTPRequestHandler):
         full_path = unquote(url.path)
         path = full_path[len(jira.context_path):] if full_path.startswith(jira.context_path) else full_path
         query = parse_qs(url.query)
-        jira.requests.append(Recorded(method, path, query, dict(self.headers), body))
+        jira.requests.append(Recorded(method, path, query, dict(self.headers), body, self.raw_body))
         if self.headers.get("Authorization", "") != f"Bearer {jira.token}":
             return self.reply(401, {"errorMessages": ["You are not authenticated."]})
         failure = jira.take_failure(method, path)
         if failure is not None:
             return self.reply(failure.status, failure.body if failure.body is not None else {"errorMessages": [f"injected {failure.status}"]}, failure.headers)
+        if jira.strict and not is_documented(method, path):  # the CLI must not depend on what the 11.3 reference does not know
+            jira.unknown_endpoints.append(f"{method} {path}")
+            return self.reply(404, {"errorMessages": [f"{method} {path} is not in the Jira Data Center 11.3 REST API reference"], "errors": {}})
+        for extension in jira.extensions:
+            if extension.handle(self, method, path, query, body):
+                return
         if not path.startswith("/rest/"):
             return self.reply(404, {"errorMessages": ["not found"]})
         if path.startswith("/rest/agile/1.0"):
@@ -514,7 +540,7 @@ class _Handler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/myself":
             return self.reply(200, USER)
         if method == "GET" and path == "/serverInfo":
-            return self.reply(200, {"version": "9.12.0", "deploymentType": "Server"})
+            return self.reply(200, {"version": "11.3.12", "deploymentType": "Server"})
         if method == "GET" and path == "/field":
             fields = [{"id": fid, "name": name, "custom": True} for fid, name in FIELD_NAMES.items()]
             return self.reply(200, fields + [{"id": "summary", "name": "Summary", "custom": False}])
@@ -524,6 +550,16 @@ class _Handler(BaseHTTPRequestHandler):
             return self.create_link(body)
         if method == "GET" and path == "/search":
             return self.search(query)
+        if method == "POST" and path == "/search":  # the same search with the parameters in a JSON body, for a JQL too long for a URL
+            request = body if isinstance(body, dict) else {}
+            return self.search(
+                {
+                    "jql": [str(request.get("jql", ""))],
+                    "startAt": [str(request.get("startAt", 0))],
+                    "maxResults": [str(request.get("maxResults", 50))],
+                    "fields": [",".join(request.get("fields") or [])],
+                }
+            )
         if method == "POST" and path == "/issue":
             return self.create_issue(body)
         if method == "GET" and path == "/project":

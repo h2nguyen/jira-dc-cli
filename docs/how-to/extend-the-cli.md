@@ -10,16 +10,18 @@ inwards**. The domain knows nothing, the application knows the domain, adapters 
 | --- | --- |
 | Add a command or an option | A module in `adapters/driving/cli/commands/`, and the use case it calls. |
 | Change how an issue is read or written | `domain/` (rules, payloads) and the use case in `application/`. |
-| Ask Jira for something new | A method on the `JiraGateway` port, its implementation in `adapters/driven/jira_rest.py`, the fake and the mock. |
+| Ask Jira for something new | A method on the port of its feature area (`application/ports_<area>.py`), its implementation in the `adapters/driven/rest_<area>.py` mixin, the fake (`tests/support/fakes_<area>.py`) and the mock route (`tests/support/mock_<area>.py`). **Only calls that the Jira Data Center 11.3 REST API reference documents**: the mock answers 404 to any other. See "Feature areas" below. |
 | Add a setting | One `SettingDef` in `application/settings.py` and a field in `Settings`. |
 | Change what Jira's JSON means | `adapters/driven/jira_mapper.py`. |
 | Support another backend (Jira Cloud) | A new class implementing `JiraGateway`, wired in `bootstrap.py`. |
-| Add another front end (an MCP server, a small web service) | A second driving adapter that calls `Application`, wired in `bootstrap.py`. |
+| Add another front end (a small web service, like the MCP server) | A second driving adapter that calls `Application`, wired in `bootstrap.py`. `jira mcp` is one (`adapters/driving/cli/mcp_server.py`): it lives in the cli package and runs commands through `main.run`. |
 | Change the text of a message or the exit code of an error | `domain/errors.py` or where the error is raised. |
 
 ## Worked example: a read-only command `jira watchers KEY`
 
-An illustration of the order (the command is not part of the program). Every step has a test.
+An illustration of the order, with a command that the program has meanwhile gained: the real `jira watchers` belongs to the feature area `collab` (see
+"Feature areas" below), so its files are `ports_collab.py`, `rest_collab.py`, `collab.py` and `commands/collab.py`, and the names below are simplified.
+Every step has a test.
 
 **1. The port.** In `application/ports.py` add to `JiraGateway`:
 
@@ -116,14 +118,51 @@ These are checked by tests where a test can check them.
   tool descriptions of `jira commands --format mcp`; a command that is not for an agent (the token, the settings) is
   listed in `MCP_EXCLUDED` in `adapters/driving/cli/help.py`, one that never asks Jira in `MCP_LOCAL`, and one that
   changes Jira in a way that is not only additive in `MCP_DESTRUCTIVE` (and `MCP_IDEMPOTENT` when repeating it changes nothing more).
+- **A command with an argument that names a path, accepts `@FILE` or overwrites** is classified in `adapters/driving/cli/mcp_calls.py` (`PATHS`: what it
+  does with the value; `AT_FILE`; `OVERWRITES`; or `NOT_A_PATH` with the reason), which is what `jira mcp` checks a call against;
+  `tests/cli/test_mcp_server.py::ClassificationTest` fails for an argument that looks like a path (its name, metavar or help says file, path, directory
+  or folder, it is `--out`, or it says `@FILE`) and is in no table. An optional path argument that the command works out a place for when it is left
+  out is in `DEFAULT_PLACES` (with the function that works the place out like the command; `tests/cli/test_mcp_server.py::DefaultPlacesTest` checks it
+  against the real command), or in `NO_DEFAULT_PLACE` with the reason why it has none: that test fails for an optional property that names a path and is in
+  neither. A command that writes files and not Jira belongs in `MCP_FILES` of `help.py`: it is of
+  `--only write` and `jira mcp` offers it only with `--allow-files`.
 - **Errors are `JiraCliError` subclasses** with a message that says what happened and a `hint` that says what to
   do. Never `print` an error from a use case, never `sys.exit` below `main`.
+- **A command that prints a list** builds its rows as dicts (the shape of its JSON), offers `listing.SELECT` and `listing.FORMAT`
+  (`--select a,b.c`, `--format table|tsv|md`) and prints through `listing.print_list`, so that every list verb behaves the same.
+- **A query that people type** (JQL, search text) goes through `_common.query_option`: `@FILE` or `-` reads it from a file or standard
+  input, because Windows PowerShell 5.1 removes the double quotes inside an argument.
+- **A command that talks on standard input and output itself** (a server such as `jira mcp`) sets `streams=True`, so that
+  `--json-envelope` does not capture its output.
 - **No I/O in `domain/` or `application/`.** Files, the clock, HTTP and the console are ports or adapters.
 - **People stay out of output by default.** Use `strip_users`, `hide_users` and `redact_text` from
   `domain/privacy.py`, and honour `settings.hide_users`.
 - **Standard library only.** `tests/test_architecture.py` fails on any other import.
 - **Results to stdout, messages to stderr**: `ctx.print`, `ctx.print_json`, `ctx.diagnostics`.
 - **No secrets in output**, including `-v`.
+
+## Feature areas
+
+`JiraGateway` is composed of **area ports**, one file per feature area, so that no file grows with every command and so that areas can be
+built side by side. For an area `X` (attachments, agile, comments, users, validation, reading, reference, collab):
+
+| File | Holds |
+| --- | --- |
+| `application/ports_X.py` | `XPort`, the abstract Jira operations of the area; `JiraGateway` inherits it. |
+| `adapters/driven/rest_X.py` | `RestX`, a mixin of `RestJiraGateway` that implements them with `self._call(...)` and, for raw bytes, `self._transport`. |
+| `application/X.py` | `XUseCases` (reached as `app.X.<use_case>`) and `build(...)`, which `Application.create` calls. |
+| `adapters/driving/cli/commands/X.py` | The `COMMANDS` of the area. |
+| `tests/support/fakes_X.py`, `tests/support/mock_X.py` | `FakeX`, a mixin of `FakeGateway` (state set up in `_init_X`), and `XRoutes`, the routes of the mock Jira. |
+
+Order of work: write the REST method and the fake method first, declare the abstract method in the port last; `JiraGateway` cannot be
+instantiated while one of the implementations lacks a declared method.
+
+**The target is Jira Data Center 11.3.x, and the tests hold you to it.** `tests/support/jira_dc_11_3_endpoints.txt` lists the calls of the
+11.3 reference (method and path); the mock Jira answers 404 to a call that is not in it and records it in `jira.unknown_endpoints`. Every
+test of a command that talks to the mock asserts that this list is empty (`tests/integration/test_conformance.py` sweeps the commands).
+Jira Cloud endpoints (such as `/issue/{key}/changelog`) and internal ones (`rest/greenhopper/*`) are not in the list: use the documented way
+(`expand=changelog`, the Agile API). The one address outside the list is the content of an attachment, `GET /secure/attachment/{id}/{name}`: it is no REST call
+(`OUTSIDE_THE_REFERENCE` in `tests/support/conformance.py`). See [compatibility](../reference/compatibility.md).
 
 ## Add a setting
 
@@ -147,7 +186,8 @@ logical field names, and select it in `bootstrap.py` from a setting.
 | --- | --- | --- |
 | `FakeGateway`, `MemoryFiles`, `MemoryConfigStore`, `MemoryCache`, `FixedClock`, `FakeDocs`, `RecordingDiagnostics`, `build_app` | `tests/support/fakes.py` | Use cases and commands without I/O. `FakeGateway.calls` records every call; `.errors[name]` makes a method fail. |
 | `run_cli(*argv, gateway=..., files=..., stdin=...)` | `tests/support/cli.py` | Run the command line in-process; returns `code`, `out`, `err`, `json()`, `error()`. |
-| `MockJira` | `tests/support/mock_jira.py` | A Jira Data Center in a thread with synthetic data. `fail_next(prefix, status, times=...)` injects errors; `.requests` records everything. |
+| `MockJira` | `tests/support/mock_jira.py` | A Jira Data Center in a thread with synthetic data. `fail_next(prefix, status, times=...)` injects errors; `.requests` records everything; `.unknown_endpoints` lists the calls that the 11.3 reference does not document (the mock answers 404 to them). The routes of a feature area live in `tests/support/mock_<area>.py`. |
+| `EndToEnd` | `tests/integration/test_end_to_end.py` | The base of whole-program tests: the real adapters against `MockJira`; `self.cli(...)`, `self.jira.sent(...)`. |
 
 ## Before you merge
 

@@ -47,7 +47,7 @@ class ReadingTest(EndToEnd):
         self.assertEqual(self.cli("ping").out, f"OK: connected to {self.jira.base_url} as Jane Doe (jdoe)\n")
         doctor = self.cli("doctor")
         self.assertEqual(doctor.code, 0, doctor.out)
-        self.assertIn("Jira 9.12.0", doctor.out)
+        self.assertIn("Jira 11.3.12", doctor.out)
 
     def test_issue(self):
         result = self.cli("issue", "PROJ-1")
@@ -236,6 +236,12 @@ class ProcessTest(EndToEnd):
     def test_standard_input_is_read_as_utf8(self):
         done = self.process("wiki", "-", stdin="# Überschrift\n".encode("utf-8"))
         self.assertEqual(done.stdout, "h1. Überschrift\n".encode("utf-8"))
+
+    def test_standard_input_may_have_a_byte_order_mark_or_be_utf16_as_powershell_pipes_it(self):
+        for data in ("# Überschrift\r\n".encode("utf-16"), b"\xef\xbb\xbf" + "# Überschrift\r\n".encode("utf-8"), "# Überschrift\r\n".encode("cp1252")):
+            with self.subTest(data=data[:4]):
+                done = self.process("wiki", "-", stdin=data)
+                self.assertEqual(done.stdout, "h1. Überschrift\n".encode("utf-8"), done.stderr)
 
     def test_a_closed_pipe_ends_quietly(self):
         inherited = {key: value for key, value in os.environ.items() if not key.startswith("JIRA_")}

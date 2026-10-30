@@ -152,6 +152,27 @@ def on_path(directory: Path) -> bool:
     return any(os.path.normcase(os.path.normpath(entry)) == wanted for entry in os.environ.get("PATH", "").split(os.pathsep) if entry)
 
 
+def sibling_launcher_folder() -> Path | None:
+    """A folder on the PATH that holds the launcher of the sibling CLI (`conflu`) and that this user can really write to (a file is created in
+    it and removed again: on Windows `os.access` says yes to every folder). The launchers of the two CLIs belong side by side, and a folder
+    that a shell already searches for one is searched for the other."""
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        folder = Path(entry) if entry else None
+        if folder and any((folder / name).is_file() for name in ("conflu", "conflu.cmd")) and can_write(folder):
+            return absolute(folder)
+    return None
+
+
+def can_write(folder: Path) -> bool:
+    import tempfile  # only the note at the end of an installation needs it
+
+    try:
+        with tempfile.TemporaryFile(dir=str(folder)):
+            return True
+    except OSError:
+        return False
+
+
 def windows_path_folder() -> Path | None:
     """A folder of the user that is on the PATH of every Windows shell without any setting: where the app
     execution aliases live. Offered as a home for the launchers when `~/bin` is on nobody's PATH but Git Bash's."""
@@ -328,10 +349,13 @@ def install(args: argparse.Namespace) -> int:
         say("  Call the launcher by its full path, or put the folder on your PATH:")
         say('  Git Bash:   echo \'export PATH="$HOME/bin:$PATH"\' >> ~/.bashrc')
         say("  PowerShell: add the folder under Settings > System > About > Advanced system settings > Environment Variables")
-        shared = windows_path_folder()
-        if shared and shared != bin_dir:
-            say("  Or install the launchers into a folder that every Windows shell searches already:")
-            say(f'    python install.py --bin-dir "{shared}"')
+        shared_folders = [(sibling_launcher_folder(), "the folder that holds the launcher of conflu"), (windows_path_folder(), "a folder that every Windows shell searches")]
+        shown: list[Path] = []
+        for folder, why in shared_folders:
+            if folder and folder != bin_dir and folder not in shown:
+                shown.append(folder)
+                say(f"  Or install the launchers into {why}:")
+                say(f'    python install.py --bin-dir "{folder}"')
     say("Next: `jira setup-pat`, then `jira config set JIRA_BASE_URL https://jira.example.com/jira`, then `jira doctor`.")
     return 0
 

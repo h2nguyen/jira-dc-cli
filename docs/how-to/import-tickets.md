@@ -12,7 +12,7 @@ Templates to copy: `examples/ticket-create.md`, `examples/tickets-create.csv`, `
 2. Find out what the project accepts: `jira project KEY` (issue types) and `jira metadata KEY` (create fields).
    `jira metadata KEY ISSUE_TYPE_ID` lists the fields of one issue type and which are required.
 3. Check that components and fix versions exist: Jira refuses unknown ones. The importer checks fix versions
-   itself and refuses with a clear message (see below); components are checked by Jira.
+   itself and refuses with a clear message (see below), and `--dry-run` also checks the priority, the components and the fix versions against what the project offers.
 4. Create **one** issue with `jira create --dry-run`, then for real in a safe project.
 5. Import two or three tickets, look at them in Jira, then import the rest.
 6. Keep the output as the import log. Rotate the token if it was exposed.
@@ -49,9 +49,11 @@ Allow users to export the monthly report.
 | `summary` | Required to create. |
 | `description` | Optional; replaces the body as the description. |
 | `labels`, `components`, `fix_versions` | Comma lists. Components and fix versions must already exist. |
-| `priority`, `assignee` | A priority name; an assignee user name. |
+| `priority`, `assignee` | A priority name; an assignee as a user name, a display name or an e-mail address that fits exactly one user (`me`, `unassigned` and `automatic` work too). A name that fits several users is refused with their number, never with a list of people. |
 | `fields_json` | A JSON object on one line for any other field, such as custom fields. A field that has its own key here (`summary`, `labels`, `priority`, ...) cannot be set in `fields_json` too; the CLI refuses instead of guessing which should win. |
 | `source_id`, `parent_id`, `source_key` | For `import-md-dir`: see below. |
+
+**The dry run validates.** `--dry-run` of `import-md`, `import-md-dir` and `import-csv` resolves the assignee, so that the payload shows the user name that Jira will get, and checks the priority, the components and the fix versions against what the project offers. A value that the project does not offer fails that file or row with exit code 6 and the allowed values in the hint, so a wrong value shows up in the dry run and not half-way through the real run. Custom fields in `fields_json` are not judged, and a real run is not checked in advance. A required field that a ticket leaves out is a warning of `jira create --dry-run`; the imports do not print warnings.
 
 `--wiki` (also `--jira-wiki`) converts the body from Markdown to Jira wiki markup: headings, lists, quotes, code
 blocks, bold and italic, links. Jira would otherwise show the Markdown characters as text. The same converter is
@@ -143,7 +145,7 @@ jira update-json DEMO-123 update.json --if-unchanged-since 2026-10-15T08:00:00Z
 ```
 
 `create.json` is `{"fields": {"project": {"key": "DEMO"}, "issuetype": {"name": "Task"}, "summary": "..."}}`;
-`update.json` holds `fields` and/or `update`. Jira validates every field against the project configuration.
+`update.json` holds `fields` and/or `update`. Jira validates every field against the project configuration. `--dry-run` first checks the standard fields that the payload names (priority, resolution, components, fix versions, affected versions) against the metadata of the project: a value that it does not offer is exit code 6, with the allowed values in the hint. `create-json` is checked when the payload names the project by `key` and the issue type by `id`. Custom fields are not judged, and a real run is not checked in advance.
 
 ## The output
 

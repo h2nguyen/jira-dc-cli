@@ -298,7 +298,7 @@ class DoctorTest(unittest.TestCase):
     def test_a_healthy_setup(self):
         checks = self.checks()
         self.assertEqual({check.status for check in checks.values()}, {"ok"})
-        self.assertIn("Jira 9.12.0", checks["server"].detail)
+        self.assertIn("Jira 11.3.12", checks["server"].detail)
 
     def test_missing_configuration_skips_the_connection(self):
         checks = self.checks(settings=settings(base_url="", pat=""))

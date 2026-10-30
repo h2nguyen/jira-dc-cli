@@ -7,7 +7,7 @@ from typing import Any, Sequence
 from ..domain import jql
 from ..domain.backlog import build_backlog_dump
 from ..domain.branching import branch_name
-from ..domain.errors import UnavailableError, UsageError, ValidationError
+from ..domain.errors import RejectedError, UnavailableError, UsageError, ValidationError
 from ..domain.fields import BACKLOG_FIELDS, EPIC_LINK, LIST_FIELDS, REPORT_FIELDS, STORY_POINTS
 from ..domain.model import FieldInfo, Issue, parse_issue_key, parse_project_key
 from ..domain.privacy import hide_users, redact_text, strip_users
@@ -41,6 +41,24 @@ def require_project(project: str, settings: Settings) -> str:
     return parse_project_key(chosen)
 
 
+def check_users(settings: Settings, with_users: bool) -> None:
+    """`--with-users` is refused under the privacy policy, before anything is asked of Jira."""
+    if with_users and settings.hide_users:
+        raise ValidationError(
+            "JIRA_HIDE_USERS=true: people are not printed, --with-users is not available.",
+            hint="Unset JIRA_HIDE_USERS if you need to see people.",
+        )
+
+
+def filter_refused(error: RejectedError, filter_id: str) -> RejectedError:
+    """Jira answers HTTP 400 to `filter = ID` when no such filter exists or the user may not see it: say where to look."""
+    return RejectedError(
+        error.message,
+        hint=f"Check that filter {filter_id} exists and that you may see it: `jira filter {filter_id}` shows it, `jira filters` lists your favourite filters.",
+        details=error.details,
+    )
+
+
 @dataclass
 class IssueView:
     issue: Issue
@@ -58,12 +76,13 @@ class ViewIssue:
         self, key: str, *, with_comments: bool = False, with_users: bool = False, want_raw: bool = False
     ) -> IssueView:
         key = parse_issue_key(key)
-        if with_users and self._settings.hide_users:
-            raise ValidationError(
-                "JIRA_HIDE_USERS=true: people are not printed, --with-users is not available.",
-                hint="Unset JIRA_HIDE_USERS if you need to see people.",
-            )
-        issue = self._gateway.get_issue(key)
+        check_users(self._settings, with_users)
+        return self.present(self._gateway.get_issue(key), with_comments=with_comments, with_users=with_users, want_raw=want_raw)
+
+    @staticmethod
+    def present(issue: Issue, *, with_comments: bool = False, with_users: bool = False, want_raw: bool = False) -> IssueView:
+        """An issue that was read, as the privacy policy lets it be shown: with people, and the text as it is, only when asked for
+        (`with_users`); with its comments only when asked for."""
         raw = issue.raw if want_raw else None
         if not with_users:
             raw = strip_users(raw) if raw is not None else None
@@ -98,15 +117,21 @@ class SearchIssues:
         fetch_everything: bool = False,
         extra_fields: Sequence[str] = (),
         hide_assignee: bool = False,
+        filter_id: str = "",
     ) -> SearchResult:
         chosen = project or self._settings.project
-        text = jql.issue_search(project=parse_project_key(chosen) if chosen else "", jql=query, mine=mine)
+        text = jql.issue_search(project=parse_project_key(chosen) if chosen else "", jql=query, mine=mine, filter_id=filter_id)
         fields = [*LIST_FIELDS, *extra_fields]
-        if fetch_everything:
-            issues, total, raw = fetch_all(self._gateway, text, fields)
-        else:
-            page = self._gateway.search(text, fields=fields, start_at=start_at, max_results=limit)
-            issues, total, raw = page.issues, page.total, page.raw_issues
+        try:
+            if fetch_everything:
+                issues, total, raw = fetch_all(self._gateway, text, fields)
+            else:
+                page = self._gateway.search(text, fields=fields, start_at=start_at, max_results=limit)
+                issues, total, raw = page.issues, page.total, page.raw_issues
+        except RejectedError as error:
+            if filter_id:
+                raise filter_refused(error, filter_id) from error
+            raise
         hidden = hide_assignee or self._settings.hide_users
         cleaned = []
         for issue in issues:
@@ -124,9 +149,11 @@ class SuggestBranch:
         self._gateway = gateway
 
     def execute(self, key: str, *, branch_type: str = "") -> str:
+        """The branch name of an issue. It is built from the summary as `jira issue` shows it, with the mentions and e-mail addresses
+        left out: a branch is pushed, and a name or an address in its name would go with it."""
         key = parse_issue_key(key)
         issue = self._gateway.get_issue(key, fields=["summary", "issuetype"])
-        return branch_name(issue.key, issue.summary, issue.issue_type, branch_type)
+        return branch_name(issue.key, hide_users(issue).summary, issue.issue_type, branch_type)
 
 
 class BuildReport:

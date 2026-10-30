@@ -12,6 +12,7 @@ from pathlib import Path
 
 from ...application.ports import ConfigStore
 from ...domain.errors import ConfigError
+from ...domain.textio import decode_text
 from .atomic import write_text_atomically
 
 _ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
@@ -93,7 +94,7 @@ class FileConfigStore(ConfigStore):
 
     def _lines(self) -> list[str]:
         try:
-            return self._path.read_text(encoding="utf-8-sig").splitlines()
+            return decode_text(self._path.read_bytes()).splitlines()  # a settings file from Notepad (UTF-16) or an "ANSI" editor is read too
         except FileNotFoundError:
             return []
         except OSError as error:

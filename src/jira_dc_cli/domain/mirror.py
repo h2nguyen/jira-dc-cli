@@ -5,14 +5,19 @@ its `jira_key` or `issue_key` line (a mirror may use either). Lines that are not
 outside what is rewritten stay as they are; a file that is rewritten ends up with plain line feeds and without a byte order mark.
 
 What is kept in step: the summary, the priority, the labels, the components, the fix versions, the story points and the acceptance
-criteria (both in `fields_json`, where the importer reads them) and the description (the Markdown body). Not the assignee, the
-status, the sprint or the comments: people are not mirrored, and the rest changes too often to be a copy that stays true.
+criteria (both in `fields_json`, where the importer reads them), the issue links (the `links:` line, see `mirror_links`) and the description
+(the Markdown body). Not the assignee, the status, the sprint or the comments: people are not mirrored, and the rest changes too often to be a
+copy that stays true.
 
 To tell which side changed since the two last agreed, the file carries `jira_base`: for every field `name=LOCAL/REMOTE`, a short digest
 of what the file held and of what Jira held when the two agreed on that field. A field of the file that no longer matches its LOCAL digest
 was edited here; a field of Jira that no longer matches its REMOTE digest was changed there. Two digests, because the text does not always
 come back the same from Markdown. Per field, because a field edited here and another changed in Jira are no conflict: each side can take
 over the other's change without touching its own.
+
+A file from before the links were kept in step has no record for them. It never listed any, so the record is taken to be "none on either side":
+the links that Jira holds are news to the file (`jira changed`), the ones that were written into it are an edit (`edited here`), and no file
+turns `differs` because of a field that did not exist when it was synced.
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ from typing import Any, Mapping, Sequence
 from .drafts import parse_json_object, split_list
 from .errors import ValidationError
 from .fields import ACCEPTANCE, STORY_POINTS
+from .mirror_links import LinkEntry, entries_of, forms, parse_line, render_line, unwritable_types
 from .model import Issue
 from .privacy import holds_placeholder, redact_text
 from .unwiki import wiki_to_markdown
@@ -35,12 +41,14 @@ KEY_LINES = ("jira_key", "issue_key")
 BASE_LINE = "jira_base"
 SYNCED_LINE = "jira_synced"
 IGNORE_FILE = "jira-sync-ignore.txt"
+LINKS = "links"  # the field, and the front matter line that lists the issue links
 
 SAME, LOCAL_CHANGED, JIRA_CHANGED, MIXED, CONFLICT, DIFFERS = "same", "local-changed", "jira-changed", "mixed", "conflict", "differs"
 LISTS = {"labels": "labels", "components": "components", "fixVersions": "fix_versions"}  # field -> front matter line
 TEXTS = ("summary", "priority", "acceptance", "description")
 BACK = "changes on the way back"  # what `lossy:` says of a description that Markdown does not carry unchanged, although it names nothing
 NO_SUCH_FIELD = "this Jira has no"  # how the reason of a field that this Jira does not have begins (`skipped_fields`)
+LINKS_AFTER = ("fix_versions", "components", "labels", "priority", "summary")  # a `links:` line that is added comes after the first of these lines that exists
 
 _KEY = re.compile(r"[A-Za-z][A-Za-z0-9_]*-[0-9]+")
 _BASE_ENTRY = re.compile(r"([A-Za-z]+)=([0-9a-f]{6})/([0-9a-f]{6})")
@@ -107,6 +115,13 @@ def light(value: Any) -> Any:
     return value
 
 
+def _digest(value: Any) -> str:
+    return hashlib.sha1(json.dumps(light(value), sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:6]
+
+
+NO_LINKS = (_digest([]), _digest([]))  # the record of the links of a file that was synced before they were kept in step: none on either side
+
+
 def carries(description: str) -> tuple[str, ...]:
     """What Markdown cannot carry of a Jira description. Sending the Markdown back would then change more than the person edited.
 
@@ -164,13 +179,19 @@ class MirrorFile:
             value = value[1:-1]
         return value
 
-    def set(self, name: str, value: Any) -> None:
+    def set(self, name: str, value: Any, *, after: Sequence[str] = ()) -> None:
+        """Write the line. A line that is not there yet is added at the end, or after the first of the lines in `after` that exists."""
         line = line_of(name, value)
         index = self._index(name)
         if index >= 0:
             self.head[index] = line
-        else:
-            self.head.append(line)
+            return
+        for anchor in after:
+            place = self._index(anchor)
+            if place >= 0:
+                self.head.insert(place + 1, line)
+                return
+        self.head.append(line)
 
     def remove(self, name: str) -> None:
         index = self._index(name)
@@ -229,7 +250,7 @@ class Managed:
 
     def digests(self) -> dict[str, str]:
         """A short digest of each field as it stands (see `light`): a whitespace-only edit changes it, the order of a list does not."""
-        return {name: hashlib.sha1(json.dumps(light(self.raw[name]), sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:6] for name in self.values}
+        return {name: _digest(self.raw[name]) for name in self.values}
 
 
 def _points(value: Any) -> float | None:
@@ -249,7 +270,8 @@ def _points(value: Any) -> float | None:
 
 
 def skipped_fields(file: MirrorFile, ids: Mapping[str, str | None], issue: Issue | None = None) -> dict[str, str]:
-    """The fields that do not take part for this file, and why. With the issue, also the lists that cannot be written as a line."""
+    """The fields that do not take part for this file, and why. With the issue, also the lists that cannot be written as a line and the links of
+    an issue with a link type whose name the `links:` line cannot hold."""
     left: dict[str, str] = {}
     if not ids.get(STORY_POINTS):
         left["storyPoints"] = f"{NO_SUCH_FIELD} story points field"
@@ -265,19 +287,26 @@ def skipped_fields(file: MirrorFile, ids: Mapping[str, str | None], issue: Issue
         for name, values in (("labels", issue.labels), ("components", issue.components), ("fixVersions", issue.fix_versions)):
             if any("," in value for value in values):
                 left[name] = "a name with a comma cannot be written in a line of comma separated names"
+        if unwritable_types(issue):
+            left[LINKS] = "a link type with a comma, < or > in its name cannot be written in the links line"
     return left
 
 
 def _build(raw: dict[str, Any], skipped: Mapping[str, str]) -> Managed:
     values: dict[str, Any] = {}
     for name, value in raw.items():
-        if name in LISTS:
+        if name in LISTS or name == LINKS:
             values[name] = sorted(value)
         elif name == "storyPoints":
             values[name] = value
         else:
             values[name] = normalize(value)
     return Managed(values, raw, dict(skipped))
+
+
+def file_links(file: MirrorFile) -> list[LinkEntry]:
+    """The links the `links:` line of the file lists. An error when the line cannot be read, or when it links the issue to itself."""
+    return parse_line(file.get(LINKS), file.key)
 
 
 def local_managed(file: MirrorFile, ids: Mapping[str, str | None], skipped: Mapping[str, str]) -> Managed:
@@ -292,6 +321,8 @@ def local_managed(file: MirrorFile, ids: Mapping[str, str | None], skipped: Mapp
         raw["acceptance"] = str(entries.get(ids.get(ACCEPTANCE) or "") or "")
     if "description" not in skipped:
         raw["description"] = markdown_to_wiki("\n" + file.rest).strip()
+    if LINKS not in skipped:
+        raw[LINKS] = forms(file_links(file))
     return _build(raw, skipped)
 
 
@@ -307,6 +338,8 @@ def remote_managed(issue: Issue, skipped: Mapping[str, str]) -> Managed:
         raw["acceptance"] = issue.acceptance
     if "description" not in skipped:
         raw["description"] = issue.description
+    if LINKS not in skipped:
+        raw[LINKS] = forms(entries_of(issue))
     return _build(raw, skipped)
 
 
@@ -335,7 +368,9 @@ def classify(local: Managed, remote: Managed, base: Base | None) -> Verdict:
     A field that differs and was never agreed on is `unknown`. Otherwise it was edited here (`local`), changed in Jira (`jira`), or both
     (`conflicts`); a field that differs but is what it was at the last agreement on both sides, as a text that does not come back the same
     from Markdown, is no difference. The state: `conflict` when there is a conflicting field, `differs` when there is an unknown one,
-    `mixed` when some fields were edited here and others changed in Jira, else `local-changed`, `jira-changed` or `same`."""
+    `mixed` when some fields were edited here and others changed in Jira, else `local-changed`, `jira-changed` or `same`.
+
+    The links are the one field that is never `unknown`: a record that has none (a file from before they were kept in step) counts as `NO_LINKS`."""
     fields = differing(local, remote)
     own, theirs = local.digests(), remote.digests()
     edited: list[str] = []
@@ -344,7 +379,7 @@ def classify(local: Managed, remote: Managed, base: Base | None) -> Verdict:
     unknown: list[str] = []
     real: list[str] = []
     for name in fields:
-        record = (base or {}).get(name)
+        record = (base or {}).get(name) or (NO_LINKS if name == LINKS else None)
         if record is None:
             unknown.append(name)
             real.append(name)
@@ -380,12 +415,14 @@ def agreement(local: Managed, remote: Managed) -> Base:
 
 def stamp(file: MirrorFile, local: Managed, remote: Managed, now: str, fields: Sequence[str] | None = None, keep: Sequence[str] = ()) -> None:
     """Record the agreement on `fields` (all of them by default): the digests of both sides and the time. The records of the other fields stay,
-    so that what is still waiting to be pulled or pushed keeps waiting. Of a field in `keep` that has a record only Jira's digest is recorded:
-    what the file held when the two last agreed stays the reference, so that an edit made here stays an edit."""
+    so that what is still waiting to be pulled or pushed keeps waiting. Of a field in `keep` only Jira's digest is recorded: what the file held
+    when the two last agreed stays the reference, so that an edit made here stays an edit (for the links of a file that has no record yet, the
+    reference is `NO_LINKS`; any other field without a record gets both digests)."""
     current = agreement(local, remote)
     kept = {name: pair for name, pair in (file.base or {}).items() if name in current}
     for name in current if fields is None else [name for name in fields if name in current]:
-        kept[name] = (kept[name][0], current[name][1]) if name in keep and name in kept else current[name]
+        reference = kept.get(name) or (NO_LINKS if name == LINKS else None)
+        kept[name] = (reference[0], current[name][1]) if name in keep and reference else current[name]
     order = list(local.values)
     file.set(BASE_LINE, ",".join(f"{name}={kept[name][0]}/{kept[name][1]}" for name in order if name in kept))
     file.set(SYNCED_LINE, now)
@@ -406,6 +443,8 @@ def apply_remote(file: MirrorFile, issue: Issue, ids: Mapping[str, str | None], 
             file.set_fields({ids.get(STORY_POINTS) or "": issue.story_points})
         elif name == "acceptance":
             file.set_fields({ids.get(ACCEPTANCE) or "": issue.acceptance or None})
+        elif name == LINKS:
+            file.set(LINKS, render_line(entries_of(issue)), after=LINKS_AFTER)
         elif name == "description":
             file.rest = "\n" + wiki_to_markdown(issue.description).text
             dropped = carries(issue.description)
@@ -428,6 +467,9 @@ def new_file(issue: Issue, ids: Mapping[str, str | None], *, key_line: str, proj
         line_of("components", ",".join(issue.components)),
         line_of("fix_versions", ",".join(issue.fix_versions)),
     ]
+    listed = [] if unwritable_types(issue) else entries_of(issue)  # a file of an issue without links has no line for them; the field is left out when a type cannot be written
+    if listed:
+        head.append(line_of(LINKS, render_line(listed)))
     if issue.epic_key:
         head.append(line_of("epic_key", issue.epic_key))
     if parent_source:
@@ -445,9 +487,12 @@ def new_file(issue: Issue, ids: Mapping[str, str | None], *, key_line: str, proj
 
 
 def update_payload(changed: Sequence[str], local: Managed, ids: Mapping[str, str | None]) -> dict[str, Any]:
-    """The request that makes Jira hold what the file holds, for the fields that differ and for no others."""
+    """The request that makes Jira hold what the file holds, for the fields that differ and for no others. The links are no field of the issue:
+    each one is a request of its own (`mirror_links.new_link`), so they are not part of this payload."""
     fields: dict[str, Any] = {}
     for name in changed:
+        if name == LINKS:
+            continue
         value = local.raw[name]
         for text in value if isinstance(value, (list, tuple)) else [value]:
             if isinstance(text, str) and "\x00" in text:
@@ -479,6 +524,8 @@ def placeholders_in(changed: Sequence[str], local: Managed) -> list[str]:
     marked = []
     for name in changed:
         value = local.raw.get(name)
+        if name == LINKS:
+            continue  # the name of a link type is no personal data
         if isinstance(value, (list, tuple)):
             if any(holds_placeholder(item) for item in value):
                 marked.append(name)
